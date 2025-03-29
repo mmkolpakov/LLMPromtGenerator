@@ -299,20 +299,8 @@ class GeneratorViewModel(
                     val placeholderData = prepareDataForGeneration(uiState.placeholderData)
                     logger.info("Placeholder data prepared: ${placeholderData.keys}")
 
-                    if (placeholderData.isEmpty()) {
-                        logger.warn("No values provided for any placeholders")
-                        updateUiState { currentState ->
-                            currentState.copy(
-                                errorMessage = "Please provide at least one placeholder value"
-                            )
-                        }
-                        isUpdating.value = false
-                        return@withLock
-                    }
-
-                    val missingPlaceholders = placeholders.filter { !placeholderData.containsKey(it) }
-                    if (missingPlaceholders.isNotEmpty()) {
-                        logger.warn("Some placeholders have no values: $missingPlaceholders")
+                    if (placeholderData.isEmpty() && placeholders.isNotEmpty()) {
+                        logger.warn("No values provided for any placeholders, will proceed with empty values")
                     }
 
                     val template = Template(
@@ -448,7 +436,7 @@ class GeneratorViewModel(
     }
 
     private fun prepareDataForGeneration(placeholderData: Map<String, String>): Map<String, Any> {
-        return placeholderData.filter { (_, value) -> value.isNotBlank() }
+        return placeholderData.filterValues { it.isNotBlank() }
             .mapValues { (_, value) ->
                 when {
                     value.trim().startsWith("[") && value.trim().endsWith("]") -> {

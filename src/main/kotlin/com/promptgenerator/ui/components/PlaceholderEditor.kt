@@ -83,6 +83,12 @@ fun PlaceholderEditor(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
+                                Text(
+                                    "• Empty variables will be replaced with blank values",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
                         }
                     ) {
@@ -142,6 +148,17 @@ fun PlaceholderEditor(
                 )
 
                 Spacer(Modifier.height(8.dp))
+
+                if (placeholders.any { (_, value) -> value.isBlank() }) {
+                    Text(
+                        text = "Note: Empty variables will be replaced with blank values in the output",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontStyle = FontStyle.Italic
+                    )
+
+                    Spacer(Modifier.height(4.dp))
+                }
 
                 Column(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -247,10 +264,17 @@ private fun PlaceholderItem(
         }
     }
 
+    val isEmptyValue = localValue.isBlank()
+    val containerColor = if (isEmptyValue) {
+        MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.2f)
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+            containerColor = containerColor
         )
     ) {
         Column(
@@ -277,6 +301,24 @@ private fun PlaceholderItem(
                 }
 
                 Row {
+                    if (isEmptyValue) {
+                        CustomTooltip(
+                            tooltip = {
+                                Text(
+                                    text = "This variable is empty and will be replaced with a blank value",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        ) {
+                            Icon(
+                                imageVector = AppIcons.Warning,
+                                contentDescription = "Empty Variable",
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(end = 8.dp)
+                            )
+                        }
+                    }
+
                     IconButton(
                         onClick = onEdit,
                         modifier = Modifier.padding(end = 4.dp)
@@ -306,7 +348,15 @@ private fun PlaceholderItem(
                 },
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("Values (comma-separated)") },
-                placeholder = { Text("e.g. value1, value2, value3") }
+                placeholder = { Text("e.g. value1, value2, value3") },
+                colors = if (isEmptyValue) {
+                    OutlinedTextFieldDefaults.colors(
+                        unfocusedBorderColor = MaterialTheme.colorScheme.error.copy(alpha = 0.5f),
+                        unfocusedLabelColor = MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
+                    )
+                } else {
+                    OutlinedTextFieldDefaults.colors()
+                }
             )
 
             AnimatedVisibility(visible = localValue.contains(",")) {
@@ -315,6 +365,15 @@ private fun PlaceholderItem(
                     style = MaterialTheme.typography.bodySmall,
                     fontStyle = FontStyle.Italic,
                     color = MaterialTheme.colorScheme.primary
+                )
+            }
+
+            AnimatedVisibility(visible = isEmptyValue) {
+                Text(
+                    text = "Empty variable will be replaced with a blank value",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontStyle = FontStyle.Italic,
+                    color = MaterialTheme.colorScheme.error
                 )
             }
         }

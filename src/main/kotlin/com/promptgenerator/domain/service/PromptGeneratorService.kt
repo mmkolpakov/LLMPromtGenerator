@@ -138,7 +138,7 @@ class PromptGeneratorService(
                 _currentGenerationState.value = requestsState
                 send(requestsState)
 
-                logger.info("Calling requestRepository.sendRequests")
+                logger.info("Calling requestRepository.sendRequests with ${requests.size} requests")
                 requestRepository.sendRequests(requests) { requestId, content, error ->
                     logger.info("Progress update for request $requestId, error: $error")
                 }

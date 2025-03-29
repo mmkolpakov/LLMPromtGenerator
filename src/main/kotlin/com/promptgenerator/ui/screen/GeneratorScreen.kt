@@ -27,6 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -177,11 +178,20 @@ fun GeneratorScreen(
                         onClick = { viewModel.generatePrompts() },
                         enabled = !uiState.isGenerating &&
                                 uiState.templateContent.isNotBlank() &&
-                                uiState.templateValidation.isValid &&
-                                uiState.placeholderData.any { (_, value) -> value.isNotBlank() },
+                                uiState.templateValidation.isValid,
                         modifier = Modifier.fillMaxWidth(0.7f)
                     ) {
                         Text("Generate Prompts")
+                    }
+
+                    if (uiState.templateValidation.placeholders.isNotEmpty() &&
+                        uiState.templateValidation.placeholders.size > uiState.placeholderData.count { (_, value) -> value.isNotBlank() }) {
+                        Text(
+                            text = "Note: Some placeholders are empty and will be replaced with blank values",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
                     }
                 }
 

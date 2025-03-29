@@ -45,8 +45,11 @@ class TemplateRepositoryImpl(
         logger.info("Relevant data for placeholders: $relevantData")
 
         if (relevantData.isEmpty()) {
-            logger.warn("No data provided for any placeholders, returning template as is")
-            return listOf(Request(UUID.randomUUID().toString(), template.content, systemInstruction))
+            logger.warn("No data provided for any placeholders, using template with empty placeholders")
+            val content = placeholders.fold(template.content) { acc, placeholder ->
+                acc.replace("{{$placeholder}}", "")
+            }
+            return listOf(Request(UUID.randomUUID().toString(), content, systemInstruction))
         }
 
         val placeholderValues = try {
@@ -63,6 +66,7 @@ class TemplateRepositoryImpl(
         val missingPlaceholders = placeholders.filter { !placeholderValues.containsKey(it) }
         for (placeholder in missingPlaceholders) {
             logger.warn("No data provided for placeholder: $placeholder - will use empty string")
+            placeholderValues[placeholder] = listOf("")
         }
 
         logger.info("Generating combinations with placeholderValues: $placeholderValues")
@@ -86,13 +90,11 @@ class TemplateRepositoryImpl(
         val placeholderKeys = placeholderValues.keys.toList()
         val maxSizes = placeholderKeys.map { placeholderValues[it]?.size ?: 1 }
 
-        // Calculate total combinations with overflow protection
         var totalCombinations = 1L
         for (size in maxSizes) {
             if (size > 0) {
                 val newTotal = totalCombinations * size
                 if (newTotal / size != totalCombinations) {
-                    // Overflow occurred
                     totalCombinations = Long.MAX_VALUE
                     break
                 }
@@ -113,7 +115,7 @@ class TemplateRepositoryImpl(
                 if (values.isEmpty()) {
                     key to ""
                 } else {
-                    key to (values[indices[i]] ?: "")
+                    key to values[indices[i]]
                 }
             }
 
@@ -150,19 +152,23 @@ class TemplateRepositoryImpl(
     private fun processPlaceholderValues(
         placeholders: Set<String>,
         data: Map<String, Any>
-    ): Map<String, List<Any>> {
-        return placeholders
-            .mapNotNull { placeholder ->
-                data[placeholder]?.let { value ->
-                    val processedValue = when (value) {
-                        is List<*> -> value.filterNotNull().ifEmpty { listOf("") }
-                        is String -> parseStringValue(value).ifEmpty { listOf("") }
-                        else -> listOf(value)
+    ): MutableMap<String, List<Any>> {
+        val result = mutableMapOf<String, List<Any>>()
+
+        for (placeholder in placeholders) {
+            if (data.containsKey(placeholder)) {
+                val value = data[placeholder]
+                when (value) {
+                    is List<*> -> result[placeholder] = value.filterNotNull().ifEmpty { listOf("") }
+                    is String -> {
+                        result[placeholder] = parseStringValue(value).ifEmpty { listOf("") }
                     }
-                    placeholder to processedValue
+                    else -> result[placeholder] = listOf(value!!)
                 }
             }
-            .toMap()
+        }
+
+        return result
     }
 
     private fun parseStringValue(value: String): List<Any> {
