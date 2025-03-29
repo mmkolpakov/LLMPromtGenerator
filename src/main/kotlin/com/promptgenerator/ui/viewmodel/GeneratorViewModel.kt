@@ -133,6 +133,11 @@ class GeneratorViewModel(
     }
 
     fun addPlaceholder(customName: String = "") {
+        if (uiState.placeholderData.isNotEmpty() &&
+            customName.contains("var")) {
+            return
+        }
+
         val validName = customName.replace(Regex("[^a-zA-Z0-9_]"), "")
         var placeholderName = if (validName.isNotBlank()) {
             validName
@@ -516,6 +521,10 @@ class GeneratorViewModel(
             placeholderData[placeholder] = uiState.placeholderData[placeholder] ?: ""
         }
 
+        if (placeholderData.isEmpty() && newPlaceholders.isEmpty()) {
+            placeholderData["var1"] = ""
+        }
+
         uiState = uiState.copy(
             templateId = template.id,
             templateName = template.name,
@@ -532,14 +541,24 @@ class GeneratorViewModel(
                 manageTemplatesUseCase.getTemplate(templateId).onSuccess { template ->
                     val newPlaceholders = promptGeneratorService.extractPlaceholders(template.content)
                     val placeholderData = if (updatePlaceholders) {
-                        newPlaceholders.associateWith { "" }
+                        if (newPlaceholders.isEmpty()) {
+                            mapOf("var1" to "")
+                        } else {
+                            newPlaceholders.associateWith { "" }
+                        }
                     } else {
                         val currentPlaceholders = uiState.placeholderData.toMutableMap()
-                        newPlaceholders.forEach { placeholder ->
-                            if (!currentPlaceholders.containsKey(placeholder)) {
-                                currentPlaceholders[placeholder] = ""
+
+                        if (newPlaceholders.isNotEmpty()) {
+                            newPlaceholders.forEach { placeholder ->
+                                if (!currentPlaceholders.containsKey(placeholder)) {
+                                    currentPlaceholders[placeholder] = ""
+                                }
                             }
+                        } else if (currentPlaceholders.isEmpty()) {
+                            currentPlaceholders["var1"] = ""
                         }
+
                         currentPlaceholders
                     }
 
