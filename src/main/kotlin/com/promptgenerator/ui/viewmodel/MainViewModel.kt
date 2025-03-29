@@ -4,61 +4,63 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.promptgenerator.config.SettingsManager
-import com.promptgenerator.config.AppSettings
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import org.slf4j.LoggerFactory
 import java.io.Closeable
 
 class MainViewModel(
     private val settingsManager: SettingsManager
 ) : Closeable {
-    // UI state
+    private val logger = LoggerFactory.getLogger(this::class.java)
+    private val viewModelScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
     var uiState by mutableStateOf(MainUiState())
         private set
 
     init {
-        // Load settings
-        val settings = settingsManager.getSettings()
-        uiState = uiState.copy(
-            isDarkTheme = settings.isDarkTheme
-        )
+        try {
+            val settings = settingsManager.getSettings()
+            uiState = uiState.copy(
+                isDarkTheme = settings.isDarkTheme
+            )
+        } catch (e: Exception) {
+            logger.error("Error loading theme setting", e)
+        }
     }
 
-    /**
-     * Navigates to the specified screen.
-     */
     fun navigateTo(screen: Screen) {
         uiState = uiState.copy(currentScreen = screen)
     }
 
-    /**
-     * Updates the app theme.
-     */
     fun setDarkTheme(isDark: Boolean) {
         uiState = uiState.copy(isDarkTheme = isDark)
 
-        // Update settings
-        val settings = settingsManager.getSettings()
-        settingsManager.updateSettings(settings.copy(isDarkTheme = isDark))
+        viewModelScope.launch {
+            try {
+                // Изменим порядок получения настроек и сохранения
+                val settings = settingsManager.getSettings()
+                val updatedSettings = settings.copy(isDarkTheme = isDark)
+                settingsManager.updateSettings(updatedSettings)
+            } catch (e: Exception) {
+                logger.error("Error updating theme setting", e)
+            }
+        }
     }
 
-    /**
-     * Releases resources
-     */
     override fun close() {
-        // No resources to release
+        viewModelScope.cancel()
     }
 }
 
-/**
- * UI state for the main screen.
- */
 data class MainUiState(
     val currentScreen: Screen = Screen.Generator,
     val isDarkTheme: Boolean = false
 )
 
-/**
- * Screens in the application.
- */
 enum class Screen {
     Generator,
     History,

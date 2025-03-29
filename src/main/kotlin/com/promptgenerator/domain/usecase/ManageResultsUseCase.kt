@@ -3,41 +3,53 @@ package com.promptgenerator.domain.usecase
 import com.promptgenerator.domain.model.GenerationResult
 import com.promptgenerator.domain.repository.ResultRepository
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.map
+import org.slf4j.LoggerFactory
 
-/**
- * Use case for result management operations
- */
 class ManageResultsUseCase(
     private val resultRepository: ResultRepository
 ) {
-    /**
-     * Gets all generation results
-     */
+    private val logger = LoggerFactory.getLogger(this::class.java)
+
     fun getAllResults(): Flow<List<GenerationResult>> {
         return resultRepository.getAllResults()
+            .catch { e ->
+                logger.error("Error getting results", e)
+                emit(emptyList())
+            }
+            .map { results ->
+                results.sortedByDescending { it.timestamp }
+            }
     }
 
-    /**
-     * Gets a specific result by ID
-     */
     suspend fun getResult(id: String): Result<GenerationResult> {
-        return resultRepository.getResult(id)
+        return try {
+            resultRepository.getResult(id)
+        } catch (e: Exception) {
+            logger.error("Error getting result: $id", e)
+            Result.failure(e)
+        }
     }
 
-    /**
-     * Exports results to files
-     */
     suspend fun exportResults(
         result: GenerationResult,
         directory: String = "generated_prompts"
     ): Result<List<String>> {
-        return resultRepository.exportResults(result, directory)
+        return try {
+            resultRepository.exportResults(result, directory)
+        } catch (e: Exception) {
+            logger.error("Error exporting results", e)
+            Result.failure(e)
+        }
     }
 
-    /**
-     * Deletes a result
-     */
     suspend fun deleteResult(id: String): Result<Boolean> {
-        return resultRepository.deleteResult(id)
+        return try {
+            resultRepository.deleteResult(id)
+        } catch (e: Exception) {
+            logger.error("Error deleting result: $id", e)
+            Result.failure(e)
+        }
     }
 }

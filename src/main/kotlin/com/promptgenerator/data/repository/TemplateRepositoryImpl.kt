@@ -9,9 +9,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
-import java.util.LinkedList
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.regex.Pattern
+import kotlin.math.min
 
 class TemplateRepositoryImpl(
     private val localDataSource: TemplateLocalDataSource
@@ -27,19 +28,24 @@ class TemplateRepositoryImpl(
     ): List<Request> {
         logger.debug("Processing template: '${template.name}'")
 
-        // Find all placeholders in the template
+        if (template.content.isBlank()) {
+            return listOf(Request(UUID.randomUUID().toString(), "", systemInstruction))
+        }
+
         val placeholders = extractPlaceholders(template.content)
 
-        // If no placeholders, return content as is
         if (placeholders.isEmpty()) {
             logger.debug("No placeholders found")
             return listOf(Request(UUID.randomUUID().toString(), template.content, systemInstruction))
         }
 
-        // Filter data to only include known placeholders
         val relevantData = data.filterKeys { placeholders.contains(it) }
 
-        // Process placeholder values safely
+        if (relevantData.isEmpty()) {
+            logger.warn("No data provided for any placeholders")
+            return listOf(Request(UUID.randomUUID().toString(), template.content, systemInstruction))
+        }
+
         val placeholderValues = try {
             processPlaceholderValues(placeholders, relevantData)
         } catch (e: Exception) {
@@ -51,20 +57,24 @@ class TemplateRepositoryImpl(
             ))
         }
 
-        // Log placeholders without data
-        placeholders.filter { !placeholderValues.containsKey(it) }.forEach { placeholder ->
+        val missingPlaceholders = placeholders.filter { !placeholderValues.containsKey(it) }
+        for (placeholder in missingPlaceholders) {
             logger.warn("No data provided for placeholder: $placeholder")
         }
 
-        // Generate combinations lazily, limiting to maxCombinations
         val lazyGenerator = CombinationGenerator(placeholderValues, maxCombinations)
 
-        // Generate requests for each combination
         return lazyGenerator.generate().map { combination ->
             var content = template.content
-            combination.forEach { (placeholder, value) ->
+            for ((placeholder, value) in combination) {
                 content = content.replace("{{$placeholder}}", value.toString())
             }
+
+            val remainingPlaceholders = extractPlaceholders(content)
+            if (remainingPlaceholders.isNotEmpty()) {
+                logger.warn("Template still contains un-replaced placeholders: $remainingPlaceholders")
+            }
+
             Request(UUID.randomUUID().toString(), content, systemInstruction)
         }
     }
@@ -74,35 +84,34 @@ class TemplateRepositoryImpl(
         data: Map<String, Any>
     ): Map<String, List<Any>> {
         return placeholders
-            .filter { data.containsKey(it) }
             .mapNotNull { placeholder ->
                 data[placeholder]?.let { value ->
-                    placeholder to when (value) {
-                        is List<*> -> value.filterNotNull()
-                        is String -> parseStringValue(value)
+                    val processedValue = when (value) {
+                        is List<*> -> value.filterNotNull().ifEmpty { listOf("") }
+                        is String -> parseStringValue(value).ifEmpty { listOf("") }
                         else -> listOf(value)
                     }
+                    placeholder to processedValue
                 }
             }
             .toMap()
     }
 
     private fun parseStringValue(value: String): List<Any> {
-        if (value.isBlank()) return emptyList()
+        if (value.isBlank()) return listOf("")
 
-        // Support explicit list format [value1, value2] or comma-separated
         return if (value.trim().startsWith("[") && value.trim().endsWith("]")) {
             val listContent = value.trim().removeSurrounding("[", "]")
-            parseCommaDelimitedList(listContent)
+            parseCommaDelimitedList(listContent).ifEmpty { listOf("") }
         } else if (value.contains(",")) {
-            parseCommaDelimitedList(value)
+            parseCommaDelimitedList(value).ifEmpty { listOf("") }
         } else {
             listOf(value)
         }
     }
 
     private fun parseCommaDelimitedList(input: String): List<String> {
-        if (input.isBlank()) return emptyList()
+        if (input.isBlank()) return listOf("")
 
         val values = mutableListOf<String>()
         var currentValue = StringBuilder()
@@ -126,12 +135,11 @@ class TemplateRepositoryImpl(
             }
         }
 
-        // Add the last value
-        if (currentValue.isNotEmpty() || input.endsWith(",")) {
-            values.add(currentValue.toString().trim())
+        val lastValue = currentValue.toString().trim()
+        if (lastValue.isNotEmpty() || input.endsWith(",")) {
+            values.add(lastValue)
         }
 
-        // Handle quoted values
         return values.map { value ->
             if (value.startsWith("\"") && value.endsWith("\"") && value.length >= 2) {
                 value.substring(1, value.length - 1)
@@ -141,57 +149,77 @@ class TemplateRepositoryImpl(
         }
     }
 
-    // Lazy combination generator
     private class CombinationGenerator(
         private val placeholderValues: Map<String, List<*>>,
-        private val maxCombinations: Int
+        private val maxCombinations: Int,
     ) {
+        private val logger = LoggerFactory.getLogger(this::class.java)
+        private val totalPossibleCombinations: Long
+
+        init {
+            totalPossibleCombinations = placeholderValues.values.fold(1L) { acc, values ->
+                acc * values.size
+            }
+
+            if (totalPossibleCombinations > maxCombinations) {
+                logger.warn("Total possible combinations ($totalPossibleCombinations) exceeds max allowed ($maxCombinations)")
+            }
+        }
+
         fun generate(): List<Map<String, Any>> {
             if (placeholderValues.isEmpty()) {
                 return listOf(emptyMap())
             }
 
-            val result = mutableListOf<Map<String, Any>>()
-            val queue = LinkedList<Pair<Int, Map<String, Any>>>()
             val placeholderKeys = placeholderValues.keys.toList()
+            val indices = IntArray(placeholderKeys.size) { 0 }
+            val result = mutableListOf<Map<String, Any>>()
+            val maxResults = min(maxCombinations, Integer.MAX_VALUE).toInt()
 
-            // Start with empty combination at index 0
-            queue.add(0 to emptyMap())
+            val counter = AtomicInteger(0)
 
-            while (queue.isNotEmpty() && result.size < maxCombinations) {
-                val (index, currentCombination) = queue.poll()
-
-                // If we've processed all placeholders, add the combination to results
-                if (index >= placeholderKeys.size) {
-                    result.add(currentCombination)
-                    continue
+            while (counter.get() < maxResults) {
+                val combination = placeholderKeys.withIndex().associate { (i, key) ->
+                    val values = placeholderValues[key] ?: emptyList<Any>()
+                    if (values.isEmpty()) {
+                        key to ""
+                    } else {
+                        val value = values[indices[i]]
+                        key to (value ?: "")
+                    }
                 }
 
-                // Get current placeholder and its values
-                val currentPlaceholder = placeholderKeys[index]
-                val values = placeholderValues[currentPlaceholder] ?: continue
+                result.add(combination)
+                counter.incrementAndGet()
 
-                // Add a new combination for each value of the current placeholder
-                for (value in values) {
-                    if (value == null) continue
+                var incrementIndex = placeholderKeys.size - 1
+                while (incrementIndex >= 0) {
+                    val valueList = placeholderValues[placeholderKeys[incrementIndex]] ?: emptyList<Any>()
+                    indices[incrementIndex] = (indices[incrementIndex] + 1) % valueList.size.coerceAtLeast(1)
 
-                    val newCombination = currentCombination + (currentPlaceholder to value)
-                    queue.add((index + 1) to newCombination)
-
-                    // Check if we've reached maximum combinations
-                    if (result.size + queue.size >= maxCombinations) {
+                    if (indices[incrementIndex] != 0) {
                         break
                     }
+
+                    incrementIndex--
+                }
+
+                if (incrementIndex < 0) {
+                    break
                 }
             }
 
-            return result.take(maxCombinations)
+            return result
         }
     }
 
     override suspend fun saveTemplate(template: Template): Result<Template> =
         withContext(Dispatchers.IO) {
             try {
+                if (!validateTemplate(template.content).isValid) {
+                    return@withContext Result.failure(IllegalArgumentException("Invalid template"))
+                }
+
                 val savedTemplate = localDataSource.saveTemplate(template)
                 Result.success(savedTemplate)
             } catch (e: Exception) {
@@ -228,19 +256,18 @@ class TemplateRepositoryImpl(
             }
         }
 
-    // Compiled patterns to avoid repeated regex compilation
     private val nestedPattern = Pattern.compile("\\{\\{[^}]*\\{\\{")
+    private val unbalancedPatternOpen = Pattern.compile("\\{\\{[^}]*$")
+    private val unbalancedPatternClose = Pattern.compile("^[^{]*\\}\\}")
 
     override fun validateTemplate(templateContent: String): ValidationResult {
         val errors = mutableListOf<String>()
 
-        // Check for empty content
         if (templateContent.isBlank()) {
             errors.add("Template content cannot be empty")
             return ValidationResult(false, errors)
         }
 
-        // Count opening and closing braces
         val openBraceCount = templateContent.count { it == '{' }
         val closeBraceCount = templateContent.count { it == '}' }
 
@@ -248,9 +275,8 @@ class TemplateRepositoryImpl(
             errors.add("Unbalanced placeholder braces: found $openBraceCount '{' and $closeBraceCount '}'")
         }
 
-        // Extract and validate placeholder names
         val placeholders = mutableSetOf<String>()
-        var matcher = placeholderPattern.matcher(templateContent)
+        val matcher = placeholderPattern.matcher(templateContent)
 
         while (matcher.find()) {
             val placeholder = matcher.group(1)
@@ -264,10 +290,19 @@ class TemplateRepositoryImpl(
             }
         }
 
-        // Check for nested or invalid placeholders
-        matcher = nestedPattern.matcher(templateContent)
-        if (matcher.find()) {
-            errors.add("Nested placeholders are not supported: ${matcher.group(0)}...")
+        val nestedMatcher = nestedPattern.matcher(templateContent)
+        if (nestedMatcher.find()) {
+            errors.add("Nested placeholders are not supported: ${nestedMatcher.group(0)}...")
+        }
+
+        val unbalancedOpenMatcher = unbalancedPatternOpen.matcher(templateContent)
+        if (unbalancedOpenMatcher.find()) {
+            errors.add("Unclosed placeholder: ${unbalancedOpenMatcher.group(0)}")
+        }
+
+        val unbalancedCloseMatcher = unbalancedPatternClose.matcher(templateContent)
+        if (unbalancedCloseMatcher.find()) {
+            errors.add("Unopened placeholder closing: ${unbalancedCloseMatcher.group(0)}")
         }
 
         return ValidationResult(

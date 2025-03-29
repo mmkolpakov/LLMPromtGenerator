@@ -2,26 +2,19 @@ package com.promptgenerator.data.source.remote
 
 import kotlinx.coroutines.delay
 import org.slf4j.LoggerFactory
-import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.atomicfu.atomic
+import kotlin.math.min
 import kotlin.random.Random
+import kotlin.time.Duration.Companion.milliseconds
 
-/**
- * Utility class for LLM clients with common functionality
- */
 class LLMClientUtils {
     private val logger = LoggerFactory.getLogger(LLMClientUtils::class.java)
-    private val isCancelled = AtomicBoolean(false)
+    private val isCancelled = atomic(false)
 
-    /**
-     * Sets the cancelled flag
-     */
     fun setCancelled(cancelled: Boolean) {
-        isCancelled.set(cancelled)
+        isCancelled.value = cancelled
     }
 
-    /**
-     * Executes a block with retry logic for rate limiting
-     */
     suspend fun <T> withRetry(
         requestId: String,
         maxRetries: Int = 3,
@@ -31,68 +24,71 @@ class LLMClientUtils {
         block: suspend () -> T
     ): T {
         var currentDelay = initialDelay
+        var attempt = 0
 
-        repeat(maxRetries) { attempt ->
+        while (true) {
             try {
                 return block()
             } catch (e: Exception) {
-                // Check if cancelled
-                if (isCancelled.get()) {
+                attempt++
+
+                if (isCancelled.value) {
                     logger.info("Operation cancelled for request: $requestId")
                     throw e
                 }
 
-                // Check if we've reached max retries
-                if (attempt == maxRetries - 1) throw e
+                if (attempt >= maxRetries) {
+                    logger.error("Max retries reached for request: $requestId", e)
+                    throw e
+                }
 
-                // If it's a rate limit error, apply backoff
                 if (isRateLimitError(e)) {
-                    logger.warn("Rate limit hit for request $requestId (attempt ${attempt + 1}/$maxRetries), backing off for $currentDelay ms")
+                    logger.warn("Rate limit hit for request $requestId (attempt $attempt/$maxRetries), backing off for $currentDelay ms")
 
-                    // Wait before retry with jitter
                     val jitter = Random.nextLong(currentDelay / 4)
-                    delay(currentDelay + jitter)
+                    val delayWithJitter = currentDelay + jitter
 
-                    // Increase delay for next attempt
-                    currentDelay = (currentDelay * factor).toLong().coerceAtMost(maxDelay)
+                    val delayChunks = 100L.milliseconds
+                    var remainingDelay = delayWithJitter
+
+                    while (remainingDelay > 0) {
+                        if (isCancelled.value) {
+                            logger.info("Retry wait cancelled for request: $requestId")
+                            throw e
+                        }
+
+                        val delayAmount = min(delayChunks.inWholeMilliseconds, remainingDelay)
+                        delay(delayAmount)
+                        remainingDelay -= delayAmount
+                    }
+
+                    currentDelay = min((currentDelay * factor).toLong(), maxDelay)
                 } else {
-                    // Don't retry other errors
                     throw e
                 }
             }
         }
-
-        throw IllegalStateException("Retry loop exited unexpectedly")
     }
 
-    /**
-     * Checks if an exception is related to rate limiting
-     */
     private fun isRateLimitError(e: Exception): Boolean {
         val message = e.message?.lowercase() ?: ""
         return message.contains("429") ||
                 message.contains("rate limit") ||
+                message.contains("rate_limit") ||
                 message.contains("too many requests") ||
-                message.contains("capacity")
+                message.contains("capacity") ||
+                message.contains("overloaded") ||
+                message.contains("throttl")
     }
 
-    /**
-     * Logs the start of a request
-     */
     fun logRequestStart(provider: String, requestId: String, model: String) {
         logger.info("Sending request $requestId to $provider using model $model")
     }
 
-    /**
-     * Logs the completion of a request
-     */
     fun logRequestSuccess(provider: String, requestId: String) {
         logger.info("Successfully received response from $provider for request $requestId")
     }
 
-    /**
-     * Logs an error for a request
-     */
     fun logRequestError(provider: String, requestId: String, error: Exception, isRetry: Boolean = false) {
         val retryMsg = if (isRetry) " during retry" else ""
         logger.error("Error from $provider for request $requestId$retryMsg: ${error.message}", error)

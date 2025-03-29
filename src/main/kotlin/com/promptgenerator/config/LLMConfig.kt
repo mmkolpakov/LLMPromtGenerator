@@ -16,7 +16,6 @@ data class LLMConfig(
         "anthropic" to ProviderConfig(
             baseUrl = "https://api.anthropic.com",
             apiKey = "",
-            anthropicVersion = "2023-06-01",
             defaultModel = "claude-3-sonnet-20240229",
             rateLimiting = RateLimitConfig()
         ),
@@ -47,7 +46,6 @@ data class ProviderConfig(
     val apiKey: String = "",
     val port: Int = 0,
     val protocol: String = "https",
-    val anthropicVersion: String = "",
     val defaultModel: String = "",
     val rateLimiting: RateLimitConfig = RateLimitConfig()
 )

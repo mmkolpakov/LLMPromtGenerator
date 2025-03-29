@@ -12,7 +12,6 @@ providers:
   anthropic:
     baseUrl: https://api.anthropic.com
     apiKey: "YOUR_API_KEY"
-    anthropicVersion: 2023-06-01
     defaultModel: claude-3-sonnet-20240229
     rateLimiting:
       requestsPerMinute: 60

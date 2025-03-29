@@ -20,7 +20,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -103,18 +104,12 @@ fun ResultsView(
         }
     }
 
-    val paginatedResults by remember(displayResults, currentPage) {
-        derivedStateOf {
-            displayResults.entries.toList()
-                .drop(currentPage * RESULTS_PER_PAGE)
-                .take(RESULTS_PER_PAGE)
-        }
-    }
-
     val totalPages = (displayResults.size + RESULTS_PER_PAGE - 1) / RESULTS_PER_PAGE
 
     LaunchedEffect(results.isNotEmpty()) {
         currentPage = 0
+        expandedItems.clear()
+        copiedItems.clear()
     }
 
     LaunchedEffect(currentPage) {
@@ -406,14 +401,22 @@ fun ResultsView(
                     }
                 }
 
-                if (paginatedResults.isNotEmpty()) {
+                if (displayResults.isNotEmpty()) {
+                    val paginatedResults = displayResults.entries
+                        .drop(currentPage * RESULTS_PER_PAGE)
+                        .take(RESULTS_PER_PAGE)
+                        .toList()
+
                     LazyColumn(
                         state = lazyListState,
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                         contentPadding = PaddingValues(vertical = 8.dp),
                         modifier = Modifier.weight(1f, false)
                     ) {
-                        items(paginatedResults, key = { it.key }) { (id, response) ->
+                        itemsIndexed(
+                            items = paginatedResults,
+                            key = { _, (id, _) -> id }
+                        ) { _, (id, response) ->
                             ResultCard(
                                 id = id,
                                 response = response,
@@ -421,7 +424,8 @@ fun ResultsView(
                                 isCopied = copiedItems[id] == true,
                                 onToggleExpand = { expandedItems[id] = !(expandedItems[id] ?: false) },
                                 onCopy = { copiedItems[id] = true },
-                                onRetry = { if (response.error != null) onRetryFailedRequest(id) }
+                                onRetry = { if (response.error != null) onRetryFailedRequest(id) },
+                                modifier = Modifier.animateItemPlacement()
                             )
                         }
                     }
@@ -440,13 +444,14 @@ private fun ResultCard(
     isCopied: Boolean,
     onToggleExpand: () -> Unit,
     onCopy: () -> Unit,
-    onRetry: () -> Unit
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     val clipboardManager = LocalClipboardManager.current
     val hasError = response.error != null
 
     OutlinedCard(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         border = BorderStroke(
             width = 1.dp,
             color = if (hasError) MaterialTheme.colorScheme.error.copy(alpha = 0.5f)
@@ -470,7 +475,7 @@ private fun ResultCard(
                     else MaterialTheme.colorScheme.primaryContainer
                 ) {
                     Text(
-                        text = "ID: ${id.substring(0, 6)}",
+                        text = "ID: ${id.substring(0, minOf(6, id.length))}",
                         style = MaterialTheme.typography.labelMedium,
                         color = if (hasError) MaterialTheme.colorScheme.onErrorContainer
                         else MaterialTheme.colorScheme.onPrimaryContainer,

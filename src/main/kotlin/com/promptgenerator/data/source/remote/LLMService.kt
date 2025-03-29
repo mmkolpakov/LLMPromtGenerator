@@ -8,27 +8,35 @@ import com.promptgenerator.domain.model.NetworkErrorType
 import com.promptgenerator.domain.model.Request
 import com.promptgenerator.domain.model.Response
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import org.slf4j.LoggerFactory
+import kotlinx.atomicfu.atomic
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
+import kotlin.time.Duration.Companion.milliseconds
 
 class LLMService(
-    private val config: LLMConfig = ConfigLoader.loadLLMConfig()
+    private val config: LLMConfig = LLMConfig(),
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
-    private val isCancelled = AtomicBoolean(false)
+    private val isCancelled = atomic(false)
     private val activeRequests = ConcurrentHashMap.newKeySet<String>()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val providerName: String = config.defaultProvider
     private val providerConfig: ProviderConfig
     private val clients = ConcurrentHashMap<String, LLMClient>()
-    private val requestCounter = AtomicInteger(0)
     private val rateLimitingMutex = Mutex()
     private val requestTimestamps = mutableListOf<Long>()
     private val maxRequestsPerMinute: Int
@@ -37,6 +45,7 @@ class LLMService(
     private val systemPrompt: String = config.defaultSystemPrompt
     private val failedAttempts = ConcurrentHashMap<String, Int>()
     private val MAX_RETRY_ATTEMPTS = 3
+    private val activeJobs = ConcurrentHashMap<String, Job>()
 
     init {
         logger.info("Initializing LLM Service with provider: $providerName")
@@ -97,7 +106,7 @@ class LLMService(
     }
 
     suspend fun sendRequest(request: Request, customSystemPrompt: String? = null): Response {
-        if (isCancelled.get()) {
+        if (isCancelled.value) {
             logger.info("Request ${request.id} skipped - cancellation is active")
             return Response(request.id, "", "Request cancelled")
         }
@@ -106,29 +115,78 @@ class LLMService(
         failedAttempts.putIfAbsent(request.id, 0)
         logger.debug("Sending request: ${request.id}")
 
-        try {
-            var cancelledDuringRateLimit = false
+        val job = scope.launch {
             try {
-                applyRateLimit()
-            } catch (e: CancellationException) {
-                cancelledDuringRateLimit = true
-                logger.info("Cancelled during rate limiting for request ${request.id}")
-                throw e
+                withContext(Dispatchers.IO) {
+                    withRateLimit()
+
+                    if (!isActive || isCancelled.value) {
+                        logger.info("Request ${request.id} cancelled after rate limiting")
+                        return@withContext
+                    }
+
+                    val client = getOrCreateClient(providerName)
+
+                    val finalRequest = when {
+                        !customSystemPrompt.isNullOrBlank() -> {
+                            request.copy(systemInstruction = customSystemPrompt)
+                        }
+                        request.systemInstruction.isNullOrBlank() && systemPrompt.isNotBlank() -> {
+                            request.copy(systemInstruction = systemPrompt)
+                        }
+                        else -> request
+                    }
+
+                    try {
+                        val content = withTimeout(300_000) {
+                            client.sendCompletionRequest(finalRequest)
+                        }
+
+                        logger.debug("Received response for request: ${request.id}")
+                    } catch (e: TimeoutCancellationException) {
+                        failedAttempts[request.id] = (failedAttempts[request.id] ?: 0) + 1
+                        logger.error("Request timed out after ${e.message}", e)
+                    } catch (e: CancellationException) {
+                        logger.info("Request ${request.id} was cancelled during execution")
+                    } catch (e: Exception) {
+                        if (isCancelled.value) {
+                            logger.info("Exception occurred but request was already cancelled: ${request.id}")
+                        } else {
+                            failedAttempts[request.id] = (failedAttempts[request.id] ?: 0) + 1
+                            logger.error("Error sending request: ${request.id}", e)
+                        }
+                    }
+                }
+            } finally {
+                activeRequests.remove(request.id)
+                activeJobs.remove(request.id)
+            }
+        }
+
+        activeJobs[request.id] = job
+
+        try {
+            if (isCancelled.value) {
+                return Response(request.id, "", "Request cancelled")
             }
 
-            if (cancelledDuringRateLimit || isCancelled.get()) {
+            withRateLimit()
+
+            if (isCancelled.value) {
                 logger.info("Request ${request.id} cancelled after rate limiting")
                 return Response(request.id, "", "Request cancelled")
             }
 
             val client = getOrCreateClient(providerName)
 
-            val finalRequest = if (!customSystemPrompt.isNullOrBlank()) {
-                request.copy(systemInstruction = customSystemPrompt)
-            } else if (request.systemInstruction.isNullOrBlank() && systemPrompt.isNotBlank()) {
-                request.copy(systemInstruction = systemPrompt)
-            } else {
-                request
+            val finalRequest = when {
+                !customSystemPrompt.isNullOrBlank() -> {
+                    request.copy(systemInstruction = customSystemPrompt)
+                }
+                request.systemInstruction.isNullOrBlank() && systemPrompt.isNotBlank() -> {
+                    request.copy(systemInstruction = systemPrompt)
+                }
+                else -> request
             }
 
             val timeoutMs = 300_000L
@@ -153,7 +211,7 @@ class LLMService(
             logger.info("Request ${request.id} was cancelled during execution")
             return Response(request.id, "", "Request cancelled")
         } catch (e: Exception) {
-            if (isCancelled.get()) {
+            if (isCancelled.value) {
                 logger.info("Exception occurred but request was already cancelled: ${request.id}")
                 return Response(request.id, "", "Request cancelled")
             }
@@ -202,14 +260,15 @@ class LLMService(
         }
     }
 
-    private suspend fun applyRateLimit() {
-        if (isCancelled.get()) {
+    private suspend fun withRateLimit() {
+        if (isCancelled.value) {
             throw CancellationException("Request cancelled before rate limiting")
         }
 
         rateLimitingMutex.withLock {
             val currentTime = System.currentTimeMillis()
             val oneMinuteAgo = currentTime - TimeUnit.MINUTES.toMillis(1)
+
             requestTimestamps.removeAll { it < oneMinuteAgo }
 
             if (requestTimestamps.size >= maxRequestsPerMinute) {
@@ -221,23 +280,23 @@ class LLMService(
 
                     rateLimitingMutex.unlock()
                     try {
-                        val checkInterval = 100L
+                        val checkInterval = 100L.milliseconds
                         var remainingWait = waitTime
 
                         while (remainingWait > 0) {
-                            if (isCancelled.get()) {
+                            if (isCancelled.value) {
                                 throw CancellationException("Request cancelled during rate limiting wait")
                             }
 
-                            val delayAmount = minOf(checkInterval, remainingWait)
-                            kotlinx.coroutines.delay(delayAmount)
+                            val delayAmount = minOf(checkInterval.inWholeMilliseconds, remainingWait)
+                            delay(delayAmount)
                             remainingWait -= delayAmount
                         }
                     } finally {
                         rateLimitingMutex.lock()
                     }
 
-                    if (isCancelled.get()) {
+                    if (isCancelled.value) {
                         throw CancellationException("Request cancelled during rate limiting wait")
                     }
                 }
@@ -248,13 +307,13 @@ class LLMService(
             }
 
             requestTimestamps.add(System.currentTimeMillis())
-            requestCounter.incrementAndGet()
         }
     }
 
     fun cancelRequests() {
         logger.info("Cancelling all requests (${activeRequests.size} active)")
-        isCancelled.set(true)
+        isCancelled.value = true
+
         clients.values.forEach { client ->
             try {
                 client.cancelRequests()
@@ -262,6 +321,11 @@ class LLMService(
                 logger.error("Error cancelling requests in client", e)
             }
         }
+
+        activeJobs.values.forEach { job ->
+            job.cancel()
+        }
+
         logger.info("All requests cancellation initiated")
     }
 
@@ -270,18 +334,28 @@ class LLMService(
     }
 
     fun close() {
-        isCancelled.set(false)
-        clients.values.forEach { client ->
-            try {
-                client.close()
-            } catch (e: Exception) {
-                logger.error("Error closing client", e)
+        isCancelled.value = false
+
+        scope.launch {
+            clients.values.forEach { client ->
+                try {
+                    client.close()
+                } catch (e: Exception) {
+                    logger.error("Error closing client", e)
+                }
             }
         }
+
+        activeJobs.values.forEach { job ->
+            job.cancel()
+        }
+
         clients.clear()
         activeRequests.clear()
         requestTimestamps.clear()
         failedAttempts.clear()
+        activeJobs.clear()
+
         logger.info("LLM Service closed")
     }
 }

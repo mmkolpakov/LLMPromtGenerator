@@ -20,34 +20,35 @@ import com.promptgenerator.ui.viewmodel.MainViewModel
 import com.promptgenerator.ui.viewmodel.SettingsViewModel
 import org.koin.dsl.module
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
-/**
- * Koin DI module for the application
- */
 val appModule = module {
-    // Configuration
     single { ConfigLoader.loadLLMConfig() }
     single { SettingsManager() }
+    factory { params ->
+        val settings = get<SettingsManager>()
+        val templatesPath = params.getOrNull<String>() ?: "templates"
+        TemplateLocalDataSource(templatesPath)
+    }
 
-    // Data sources
-    single { TemplateLocalDataSource() }
-    single { ResultLocalDataSource() }
-    single { LLMService(get()) }
+    factory {
+        val settings = get<SettingsManager>()
+        ResultLocalDataSource(resultsDir = "results", maxCachedResults = 100)
+    }
 
-    // Repositories
-    single<TemplateRepository> { TemplateRepositoryImpl(get()) }
+    factory { LLMService(get()) }
+
+    single<TemplateRepository> { TemplateRepositoryImpl(get(parameters = { TODO() })) }
     single<RequestRepository> { RequestRepositoryImpl(get()) }
     single<ResultRepository> { ResultRepositoryImpl(get(), get()) }
 
-    // Services
     single { PromptGeneratorService(get(), get(), get()) }
 
-    // Use cases
-    single { ManageTemplatesUseCase(get()) }
-    single { ManageResultsUseCase(get()) }
+    factory { ManageTemplatesUseCase(get()) }
+    factory { ManageResultsUseCase(get()) }
 
-    single { MainViewModel(get()) }
-    single { GeneratorViewModel(get(), get(), get()) }
-    single { HistoryViewModel(get()) }
-    single { SettingsViewModel(get(), get()) }
+    factory { MainViewModel(get()) }
+    factory { GeneratorViewModel(get(), get(), get()) }
+    factory { HistoryViewModel(get()) }
+    factory { SettingsViewModel(get(), get()) }
 }

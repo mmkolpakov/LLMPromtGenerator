@@ -8,12 +8,22 @@ import com.promptgenerator.config.ProviderConfig
 import com.promptgenerator.config.RequestDefaults
 import com.promptgenerator.domain.model.Request
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
-import java.io.IOException
-import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.atomicfu.atomic
 import org.apache.http.HttpException
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 
 class GeminiClient(
     private val providerConfig: ProviderConfig,
@@ -21,7 +31,10 @@ class GeminiClient(
 ) : LLMClient {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val utils = LLMClientUtils()
-    private val isCancelled = AtomicBoolean(false)
+    private val isCancelled = atomic(false)
+    private val activeRequests = ConcurrentHashMap<String, Job>()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val requestMutex = Mutex()
     private val client: Client
 
     init {
@@ -31,7 +44,6 @@ class GeminiClient(
             logger.warn("API key is blank - Gemini API will likely reject requests!")
         }
 
-        // Initialize the official Google Gemini client
         client = Client.builder()
             .apiKey(providerConfig.apiKey)
             .build()
@@ -43,7 +55,7 @@ class GeminiClient(
         logger.debug("Sending request to Gemini: ${request.id}")
         utils.logRequestStart("Gemini", request.id, providerConfig.defaultModel)
 
-        if (isCancelled.get()) {
+        if (isCancelled.value) {
             throw CancellationException("Request cancelled before sending")
         }
 
@@ -51,77 +63,118 @@ class GeminiClient(
             throw RuntimeException("API key is required for Gemini API")
         }
 
-        return try {
-            withContext(Dispatchers.IO) {
-                utils.withRetry(request.id) {
-                    val result = sendGeminiRequest(request.content)
-                    utils.logRequestSuccess("Gemini", request.id)
-                    result
+        return withContext(Dispatchers.IO) {
+            utils.withRetry(request.id) {
+                val requestJob = scope.launch {
+                    try {
+                        requestMutex.withLock {
+                            if (!isActive || isCancelled.value) {
+                                return@withLock
+                            }
+
+                            val result = withTimeoutOrNull(300_000) {
+                                sendGeminiRequest(
+                                    prompt = request.content,
+                                    systemPrompt = request.systemInstruction
+                                )
+                            } ?: throw RuntimeException("Request timed out after 5 minutes")
+
+                            utils.logRequestSuccess("Gemini", request.id)
+                        }
+                    } catch (e: CancellationException) {
+                        logger.info("Gemini request cancelled: ${request.id}")
+                        throw e
+                    } catch (e: Exception) {
+                        utils.logRequestError("Gemini", request.id, e)
+                        logger.error("Gemini API request failed for ${request.id}: ${e.message}", e)
+                        throw e
+                    } finally {
+                        activeRequests.remove(request.id)
+                    }
                 }
+
+                activeRequests[request.id] = requestJob
+
+                val result = sendGeminiRequest(
+                    prompt = request.content,
+                    systemPrompt = request.systemInstruction
+                )
+
+                utils.logRequestSuccess("Gemini", request.id)
+                result
             }
-        } catch (e: CancellationException) {
-            logger.info("Request cancelled: ${request.id}")
-            throw e
-        } catch (e: Exception) {
-            utils.logRequestError("Gemini", request.id, e)
-            logger.error("Gemini API request failed for ${request.id}: ${e.message}", e)
-            throw RuntimeException("Gemini API request failed: ${e.message}", e)
         }
     }
 
-    private fun sendGeminiRequest(prompt: String): String {
-        if (isCancelled.get()) {
+    private suspend fun sendGeminiRequest(prompt: String, systemPrompt: String? = null): String {
+        if (isCancelled.value) {
             throw CancellationException("Request cancelled during execution")
         }
 
-        try {
-            // Create the configuration with the request defaults
-            val config = GenerateContentConfig.builder()
-                .temperature(requestDefaults.temperature.toFloat())
-                .topP(requestDefaults.topP.toFloat())
-                .maxOutputTokens(requestDefaults.maxTokens)
-                .build()
+        return withContext(Dispatchers.IO) {
+            try {
+                val config = GenerateContentConfig.builder()
+                    .temperature(requestDefaults.temperature.toFloat())
+                    .topP(requestDefaults.topP.toFloat())
+                    .maxOutputTokens(requestDefaults.maxTokens)
+                    .build()
 
-            // Select the model to use
-            val modelName = providerConfig.defaultModel
+                val modelName = providerConfig.defaultModel
+                var fullPrompt = prompt
 
-            // Use the simple text input method for generating content
-            val response: GenerateContentResponse = client.models.generateContent(
-                modelName,
-                prompt,
-                config
-            )
+                if (!systemPrompt.isNullOrBlank()) {
+                    fullPrompt = "System instructions: $systemPrompt\n\nUser request: $prompt"
+                }
 
-            // Check for finished response
-            if (response.candidates().isEmpty()) {
-                logger.warn("No candidates returned from Gemini API")
-                return "No response generated"
+                val response: GenerateContentResponse = client.models.generateContent(
+                    modelName,
+                    fullPrompt,
+                    config
+                )
+
+                if (response.candidates().isEmpty()) {
+                    logger.warn("No candidates returned from Gemini API")
+                    return@withContext "No response generated"
+                }
+
+                val responseText = response.text() ?: "No Response"
+
+                return@withContext responseText
+            } catch (e: IOException) {
+                logger.error("IO error when calling Gemini API: ${e.message}")
+                throw RuntimeException("IO error when calling Gemini API: ${e.message}", e)
+            } catch (e: HttpException) {
+                logger.error("HTTP error when calling Gemini API: ${e.message}")
+                throw RuntimeException("HTTP error when calling Gemini API: ${e.message}", e)
             }
-
-            // Extract and process the text from the response
-            val responseText = response.text() ?: "No Response"
-
-            return responseText
-
-        } catch (e: IOException) {
-            logger.error("IO error when calling Gemini API: ${e.message}")
-            throw RuntimeException("IO error when calling Gemini API: ${e.message}", e)
-        } catch (e: HttpException) {
-            logger.error("HTTP error when calling Gemini API: ${e.message}")
-            throw RuntimeException("HTTP error when calling Gemini API: ${e.message}", e)
         }
     }
 
     override fun cancelRequests() {
-        isCancelled.set(true)
+        isCancelled.value = true
         utils.setCancelled(true)
-        logger.info("Request cancellation flag set")
+
+        val jobs = activeRequests.values.toList()
+        jobs.forEach { job ->
+            job.cancel()
+        }
+
+        activeRequests.clear()
+        logger.info("Request cancellation completed")
     }
 
     override fun close() {
         try {
-            // The Google client doesn't have an explicit close method,
-            // but we should release any resources we're holding
+            isCancelled.value = false
+            utils.setCancelled(false)
+
+            val jobs = activeRequests.values.toList()
+            jobs.forEach { job ->
+                job.cancel()
+            }
+
+            activeRequests.clear()
+            scope.cancel()
             logger.info("Gemini client closed")
         } catch (e: Exception) {
             logger.error("Error closing Gemini client", e)

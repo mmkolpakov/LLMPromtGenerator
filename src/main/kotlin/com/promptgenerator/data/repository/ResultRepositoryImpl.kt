@@ -11,8 +11,14 @@ import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.Path
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.io.path.createDirectories
+import kotlin.io.path.exists
+import kotlin.io.path.isDirectory
 
 class ResultRepositoryImpl(
     private val localDataSource: ResultLocalDataSource,
@@ -78,18 +84,19 @@ class ResultRepositoryImpl(
             val settings = settingsManager.getSettings()
             val fileExtension = settings.exportFileFormat
 
-            val outputDir = File(directory)
+            val outputDir = Path.of(directory)
             if (!outputDir.exists()) {
-                val dirCreated = outputDir.mkdirs()
-                if (!dirCreated) {
-                    throw IOException("Failed to create directory: $directory")
+                try {
+                    outputDir.createDirectories()
+                } catch (e: IOException) {
+                    logger.error("Failed to create directory: $directory", e)
+                    throw IOException("Failed to create directory: $directory", e)
                 }
-            } else if (!outputDir.isDirectory) {
+            } else if (!outputDir.isDirectory()) {
                 throw IOException("Path exists but is not a directory: $directory")
             }
 
             val dateStr = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
-
             val templateNameSafe = result.templateName
                 .replace(Regex("[^a-zA-Z0-9-_]"), "_")
                 .take(20)
@@ -97,25 +104,25 @@ class ResultRepositoryImpl(
             val savedFiles = mutableListOf<String>()
 
             result.responses.forEach { (id, response) ->
-                if (response.error == null) {
-                    val fileName = "${templateNameSafe}_${dateStr}_${id.substring(0, 6)}.${fileExtension}"
-                    val file = File(outputDir, fileName)
+                if (response.error != null) return@forEach
 
-                    try {
-                        file.bufferedWriter(Charsets.UTF_8).use { writer ->
-                            writer.write(response.content)
-                        }
+                val fileName = "${templateNameSafe}_${dateStr}_${id.substring(0, 6)}.${fileExtension}"
+                val file = outputDir.resolve(fileName).toFile()
 
-                        if (!file.exists() || file.length() == 0L) {
-                            throw IOException("Failed to write content to file: ${file.absolutePath}")
-                        }
-
-                        savedFiles.add(file.absolutePath)
-                        logger.info("Saved result to ${file.absolutePath} as .${fileExtension} file")
-                    } catch (e: Exception) {
-                        logger.error("Error writing to file ${file.absolutePath}", e)
-                        throw e
+                try {
+                    file.outputStream().bufferedWriter().use { writer ->
+                        writer.write(response.content)
                     }
+
+                    if (!file.exists() || file.length() == 0L) {
+                        throw IOException("Failed to write content to file: ${file.absolutePath}")
+                    }
+
+                    savedFiles.add(file.absolutePath)
+                    logger.info("Saved result to ${file.absolutePath} as .${fileExtension} file")
+                } catch (e: Exception) {
+                    logger.error("Error writing to file ${file.absolutePath}", e)
+                    throw e
                 }
             }
 

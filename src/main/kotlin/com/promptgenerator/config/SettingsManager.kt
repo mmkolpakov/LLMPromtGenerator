@@ -5,48 +5,86 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.Paths
-import java.util.concurrent.locks.ReentrantReadWriteLock
-import kotlin.concurrent.read
-import kotlin.concurrent.write
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.atomicfu.atomic
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.IOException
 
 class SettingsManager {
     private val logger = LoggerFactory.getLogger(SettingsManager::class.java)
     private val json = Json { prettyPrint = true }
-    private val settingsLock = ReentrantReadWriteLock()
+    private val settingsMutex = Mutex()
     private val configManager = ConfigManager.instance
 
-    private val settingsDir = Paths.get(System.getProperty("user.home"), ".promptgenerator").toFile()
-    private val settingsFile = File(settingsDir, "settings.json")
+    private val settingsDir = Paths.get(System.getProperty("user.home"), ".promptgenerator")
+    private val settingsFile = settingsDir.resolve("settings.json").toFile()
 
-    // Initialize settings
-    private var currentSettings = loadSettings()
+    private val currentSettings = atomic<AppSettings?>(null)
 
-    fun getSettings(): AppSettings = settingsLock.read { currentSettings }
-
-    fun updateSettings(settings: AppSettings) {
-        settingsLock.write {
-            currentSettings = settings
-            saveSettings(settings)
+    fun getSettings(): AppSettings {
+        return currentSettings.value ?: loadSettingsSync().also {
+            currentSettings.value = it
         }
     }
 
-    fun updateProviderConfig(providerName: String, config: ProviderConfig): Boolean {
-        return configManager.updateProviderConfig(providerName, config)
+    suspend fun updateSettings(settings: AppSettings): Result<AppSettings> = withContext(Dispatchers.IO) {
+        settingsMutex.withLock {
+            return@withContext try {
+                saveSettings(settings)
+                currentSettings.value = settings
+                Result.success(settings)
+            } catch (e: Exception) {
+                logger.error("Failed to update settings", e)
+                Result.failure(e)
+            }
+        }
     }
 
-    fun saveConfig(config: LLMConfig): Boolean {
-        return configManager.saveConfig(config)
+    suspend fun updateProviderConfig(providerName: String, config: ProviderConfig): Result<Boolean> {
+        return try {
+            val result = configManager.updateProviderConfig(providerName, config)
+            if (result) {
+                Result.success(true)
+            } else {
+                Result.failure(IOException("Failed to update provider config"))
+            }
+        } catch (e: Exception) {
+            logger.error("Failed to update provider config: $providerName", e)
+            Result.failure(e)
+        }
     }
 
-    private fun loadSettings(): AppSettings {
+    suspend fun saveConfig(config: LLMConfig): Result<Boolean> {
+        return try {
+            val result = configManager.saveConfig(config)
+            if (result) {
+                Result.success(true)
+            } else {
+                Result.failure(IOException("Failed to save config file"))
+            }
+        } catch (e: Exception) {
+            logger.error("Failed to save config", e)
+            Result.failure(e)
+        }
+    }
+
+    private fun loadSettingsSync(): AppSettings {
         return try {
             if (settingsFile.exists()) {
                 val content = settingsFile.readText()
-                Json.decodeFromString<AppSettings>(content)
+                try {
+                    Json.decodeFromString<AppSettings>(content)
+                } catch (e: Exception) {
+                    logger.error("Failed to parse settings file, creating default", e)
+                    createDefaultSettings()
+                }
             } else {
-                // Create default settings
-                AppSettings().also { saveSettings(it) }
+                createDefaultSettings()
             }
         } catch (e: Exception) {
             logger.error("Failed to load settings", e)
@@ -54,59 +92,76 @@ class SettingsManager {
         }
     }
 
-    private fun saveSettings(settings: AppSettings) {
+    private fun createDefaultSettings(): AppSettings {
+        val settings = AppSettings()
         try {
-            if (!settingsDir.exists()) {
-                val created = settingsDir.mkdirs()
-                if (!created) {
-                    logger.error("Failed to create directory: ${settingsDir.absolutePath}")
-                    return
+            saveSettingsSync(settings)
+        } catch (e: Exception) {
+            logger.error("Failed to save default settings", e)
+        }
+        return settings
+    }
+
+    private fun saveSettingsSync(settings: AppSettings) {
+        try {
+            Files.createDirectories(settingsDir)
+
+            val tempFile = File.createTempFile("settings", ".json", settingsDir.toFile())
+            tempFile.writeText(json.encodeToString(settings))
+
+            if (tempFile.length() > 0) {
+                if (settingsFile.exists()) {
+                    settingsFile.delete()
                 }
+
+                if (!tempFile.renameTo(settingsFile)) {
+                    tempFile.copyTo(settingsFile, overwrite = true)
+                    tempFile.delete()
+                }
+            } else {
+                throw IOException("Failed to write settings: empty file")
             }
-            val content = json.encodeToString(settings)
-            settingsFile.writeText(content)
         } catch (e: Exception) {
             logger.error("Failed to save settings", e)
+            throw e
         }
+    }
+
+    private suspend fun saveSettings(settings: AppSettings) = withContext(Dispatchers.IO) {
+        saveSettingsSync(settings)
     }
 }
 
 class ConfigManager private constructor() {
     private val logger = LoggerFactory.getLogger(ConfigManager::class.java)
-    private val configLock = ReentrantReadWriteLock()
-    private var cachedConfig: LLMConfig? = null
+    private val configMutex = Mutex()
+    private val cachedConfig = atomic<LLMConfig?>(null)
 
     companion object {
         val instance: ConfigManager by lazy { ConfigManager() }
     }
 
-    fun updateProviderConfig(providerName: String, config: ProviderConfig): Boolean {
-        return configLock.write {
+    suspend fun updateProviderConfig(providerName: String, config: ProviderConfig): Boolean {
+        return configMutex.withLock {
             try {
-                // Get current config (from cache or load new)
-                val currentConfig = cachedConfig ?: ConfigLoader.loadLLMConfig()
+                val currentConfig = cachedConfig.value ?: ConfigLoader.loadLLMConfig()
 
-                // Update the provider config
                 val updatedProviders = currentConfig.providers.toMutableMap()
                 updatedProviders[providerName] = config
 
-                // Create new config with updated providers
                 val newConfig = currentConfig.copy(providers = updatedProviders)
 
-                // Save the updated config
                 val result = YamlConfigWriter.writeConfig(newConfig, "config/llm-config.yaml")
 
-                // Update cache if successful
                 if (result) {
-                    cachedConfig = newConfig
-                    // Also reload in ConfigLoader
+                    cachedConfig.value = newConfig
                     ConfigLoader.reloadConfig()
                     logger.info("Provider config updated successfully for: $providerName")
+                    true
                 } else {
                     logger.error("Failed to write updated config for provider: $providerName")
+                    false
                 }
-
-                result
             } catch (e: Exception) {
                 logger.error("Failed to update provider config for $providerName", e)
                 false
@@ -114,14 +169,16 @@ class ConfigManager private constructor() {
         }
     }
 
-    fun saveConfig(config: LLMConfig): Boolean {
-        return configLock.write {
+    suspend fun saveConfig(config: LLMConfig): Boolean {
+        return configMutex.withLock {
             val result = YamlConfigWriter.writeConfig(config, "config/llm-config.yaml")
             if (result) {
-                cachedConfig = config
+                cachedConfig.value = config
                 ConfigLoader.reloadConfig()
+                true
+            } else {
+                false
             }
-            result
         }
     }
 }

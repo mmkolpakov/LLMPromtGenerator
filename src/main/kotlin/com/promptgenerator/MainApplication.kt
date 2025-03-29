@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -38,6 +39,7 @@ import androidx.compose.ui.window.WindowState
 import androidx.compose.ui.window.application
 import ch.qos.logback.classic.Level
 import ch.qos.logback.classic.Logger
+import com.promptgenerator.config.ConfigLoader
 import com.promptgenerator.di.appModule
 import com.promptgenerator.ui.icons.AppIcons
 import com.promptgenerator.ui.screen.MainScreen
@@ -51,13 +53,10 @@ import org.koin.compose.KoinApplication
 import org.koin.compose.koinInject
 import org.slf4j.LoggerFactory
 
-/**
- * Main entry point for the application
- */
 @OptIn(ExperimentalComposeUiApi::class)
 fun main() {
-    // Configure logging level
     configureLogging()
+    ConfigLoader.ensureConfigDirectoryExists()
 
     application {
         Window(
@@ -74,9 +73,6 @@ fun main() {
     }
 }
 
-/**
- * Root component that handles splash screen and main app transition
- */
 @Composable
 fun AppRoot() {
     var showSplash by remember { mutableStateOf(true) }
@@ -85,10 +81,8 @@ fun AppRoot() {
     val historyViewModel = koinInject<HistoryViewModel>()
     val settingsViewModel = koinInject<SettingsViewModel>()
 
-    // Apply theme
     PromptGeneratorTheme(darkTheme = mainViewModel.uiState.isDarkTheme) {
         Box(modifier = Modifier.fillMaxSize()) {
-            // Main app content
             AnimatedVisibility(
                 visible = !showSplash,
                 enter = fadeIn(
@@ -106,7 +100,6 @@ fun AppRoot() {
                 )
             }
 
-            // Splash screen
             AnimatedVisibility(
                 visible = showSplash,
                 exit = fadeOut(
@@ -126,17 +119,13 @@ fun AppRoot() {
             }
         }
 
-        // Auto-hide splash after delay
         LaunchedEffect(Unit) {
-            delay(2000) // 2 seconds
+            delay(2000)
             showSplash = false
         }
     }
 }
 
-/**
- * Splash screen component shown during application initialization
- */
 @Composable
 fun SplashScreen() {
     Box(
@@ -149,7 +138,6 @@ fun SplashScreen() {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            // App icon
             Icon(
                 imageVector = AppIcons.Generate,
                 contentDescription = null,
@@ -159,7 +147,6 @@ fun SplashScreen() {
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // App name
             Text(
                 text = "Prompt Generator",
                 color = Color.White,
@@ -169,7 +156,6 @@ fun SplashScreen() {
 
             Spacer(modifier = Modifier.height(32.dp))
 
-            // Loading indicator
             CircularProgressIndicator(
                 modifier = Modifier.size(48.dp),
                 color = Color.White.copy(alpha = 0.8f),
@@ -179,9 +165,6 @@ fun SplashScreen() {
     }
 }
 
-/**
- * Configures the logging level for the application
- */
 private fun configureLogging() {
     val rootLogger = LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME) as Logger
     rootLogger.level = Level.INFO

@@ -5,6 +5,7 @@ plugins {
     kotlin("plugin.serialization") version "2.1.20"
     id("org.jetbrains.compose")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("org.jetbrains.kotlinx.atomicfu") version "0.27.0"
 }
 
 group = "com.promptgenerator"

@@ -10,6 +10,7 @@ import com.promptgenerator.config.SettingsManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import java.io.Closeable
@@ -21,7 +22,6 @@ class SettingsViewModel(
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val viewModelScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    // UI state
     var uiState by mutableStateOf(SettingsUiState())
         private set
 
@@ -29,49 +29,50 @@ class SettingsViewModel(
         loadSettings()
     }
 
-    /**
-     * Loads application settings
-     */
     private fun loadSettings() {
-        // Load app settings
-        val settings = settingsManager.getSettings()
+        viewModelScope.launch {
+            try {
+                val settings = settingsManager.getSettings()
 
-        // Load provider configs
-        val providers = llmConfig.providers.map { (name, config) ->
-            ProviderSettingsUiState(
-                name = name,
-                baseUrl = config.baseUrl,
-                apiKey = config.apiKey,
-                defaultModel = config.defaultModel,
-                isEditing = false
-            )
+                val providers = llmConfig.providers.map { (name, config) ->
+                    ProviderSettingsUiState(
+                        name = name,
+                        baseUrl = config.baseUrl,
+                        apiKey = config.apiKey,
+                        defaultModel = config.defaultModel,
+                        isEditing = false
+                    )
+                }
+
+                uiState = uiState.copy(
+                    maxCombinations = settings.maxCombinations,
+                    showPartialResults = settings.showPartialResults,
+                    resultsLimit = settings.resultsLimit,
+                    saveResultsPath = settings.saveResultsPath,
+                    saveTemplatesPath = settings.saveTemplatesPath,
+                    exportFileFormat = settings.exportFileFormat,
+                    providers = providers,
+                    defaultProvider = llmConfig.defaultProvider
+                )
+            } catch (e: Exception) {
+                logger.error("Error loading settings", e)
+                uiState = uiState.copy(
+                    errorMessage = "Error loading settings: ${e.message}"
+                )
+            }
         }
-
-        uiState = uiState.copy(
-            maxCombinations = settings.maxCombinations,
-            showPartialResults = settings.showPartialResults,
-            resultsLimit = settings.resultsLimit,
-            saveResultsPath = settings.saveResultsPath,
-            saveTemplatesPath = settings.saveTemplatesPath,
-            providers = providers,
-            defaultProvider = llmConfig.defaultProvider
-        )
     }
 
-    /**
-     * Updates application settings
-     */
     fun updateSettings(
         maxCombinations: Int,
         showPartialResults: Boolean,
         resultsLimit: Int,
         saveResultsPath: String,
         saveTemplatesPath: String,
-        exportFileFormat: String // Новый параметр
+        exportFileFormat: String
     ) {
         viewModelScope.launch {
             try {
-                // Update settings
                 val settings = AppSettings(
                     isDarkTheme = settingsManager.getSettings().isDarkTheme,
                     maxCombinations = maxCombinations,
@@ -82,18 +83,21 @@ class SettingsViewModel(
                     exportFileFormat = exportFileFormat
                 )
 
-                settingsManager.updateSettings(settings)
-
-                // Update UI
-                uiState = uiState.copy(
-                    maxCombinations = maxCombinations,
-                    showPartialResults = showPartialResults,
-                    resultsLimit = resultsLimit,
-                    saveResultsPath = saveResultsPath,
-                    saveTemplatesPath = saveTemplatesPath,
-                    exportFileFormat = exportFileFormat,
-                    successMessage = "Settings updated successfully"
-                )
+                settingsManager.updateSettings(settings).onSuccess {
+                    uiState = uiState.copy(
+                        maxCombinations = maxCombinations,
+                        showPartialResults = showPartialResults,
+                        resultsLimit = resultsLimit,
+                        saveResultsPath = saveResultsPath,
+                        saveTemplatesPath = saveTemplatesPath,
+                        exportFileFormat = exportFileFormat,
+                        successMessage = "Settings updated successfully"
+                    )
+                }.onFailure { e ->
+                    uiState = uiState.copy(
+                        errorMessage = "Error updating settings: ${e.message}"
+                    )
+                }
             } catch (e: Exception) {
                 logger.error("Error updating settings", e)
                 uiState = uiState.copy(
@@ -103,9 +107,6 @@ class SettingsViewModel(
         }
     }
 
-    /**
-     * Updates a provider configuration
-     */
     fun updateProvider(
         name: String,
         baseUrl: String,
@@ -114,7 +115,6 @@ class SettingsViewModel(
     ) {
         viewModelScope.launch {
             try {
-                // Create updated provider config
                 val existingConfig = llmConfig.providers[name]
                 if (existingConfig != null) {
                     val updatedConfig = existingConfig.copy(
@@ -123,27 +123,35 @@ class SettingsViewModel(
                         defaultModel = defaultModel
                     )
 
-                    // Update config
-                    settingsManager.updateProviderConfig(name, updatedConfig)
+                    settingsManager.updateProviderConfig(name, updatedConfig).onSuccess { success ->
+                        if (success) {
+                            val updatedProviders = uiState.providers.map {
+                                if (it.name == name) {
+                                    it.copy(
+                                        baseUrl = baseUrl,
+                                        apiKey = apiKey,
+                                        defaultModel = defaultModel,
+                                        isEditing = false
+                                    )
+                                } else {
+                                    it
+                                }
+                            }
 
-                    // Update UI
-                    val updatedProviders = uiState.providers.map {
-                        if (it.name == name) {
-                            it.copy(
-                                baseUrl = baseUrl,
-                                apiKey = apiKey,
-                                defaultModel = defaultModel,
-                                isEditing = false
+                            uiState = uiState.copy(
+                                providers = updatedProviders,
+                                successMessage = "Provider updated successfully"
                             )
                         } else {
-                            it
+                            uiState = uiState.copy(
+                                errorMessage = "Failed to update provider configuration"
+                            )
                         }
+                    }.onFailure { e ->
+                        uiState = uiState.copy(
+                            errorMessage = "Error updating provider: ${e.message}"
+                        )
                     }
-
-                    uiState = uiState.copy(
-                        providers = updatedProviders,
-                        successMessage = "Provider updated successfully"
-                    )
                 }
             } catch (e: Exception) {
                 logger.error("Error updating provider", e)
@@ -154,24 +162,26 @@ class SettingsViewModel(
         }
     }
 
-    /**
-     * Sets the default provider
-     */
     fun setDefaultProvider(providerName: String) {
         viewModelScope.launch {
             try {
-                // Update the default provider in the config
                 val updatedConfig = llmConfig.copy(defaultProvider = providerName)
 
-                // Save the updated config
-                if (settingsManager.saveConfig(updatedConfig)) {
-                    // Update UI
+                settingsManager.saveConfig(updatedConfig).onSuccess { success ->
+                    if (success) {
+                        uiState = uiState.copy(
+                            defaultProvider = providerName,
+                            successMessage = "Default provider set to $providerName"
+                        )
+                    } else {
+                        uiState = uiState.copy(
+                            errorMessage = "Failed to save configuration"
+                        )
+                    }
+                }.onFailure { e ->
                     uiState = uiState.copy(
-                        defaultProvider = providerName,
-                        successMessage = "Default provider set to $providerName"
+                        errorMessage = "Error setting default provider: ${e.message}"
                     )
-                } else {
-                    throw Exception("Failed to save configuration")
                 }
             } catch (e: Exception) {
                 logger.error("Error setting default provider", e)
@@ -182,9 +192,6 @@ class SettingsViewModel(
         }
     }
 
-    /**
-     * Clears error or success message
-     */
     fun clearMessage() {
         uiState = uiState.copy(
             errorMessage = null,
@@ -192,17 +199,11 @@ class SettingsViewModel(
         )
     }
 
-    /**
-     * Releases resources
-     */
     override fun close() {
-        // No resources to release
+        viewModelScope.cancel()
     }
 }
 
-/**
- * UI state for settings screen
- */
 data class SettingsUiState(
     val maxCombinations: Int = 1000,
     val showPartialResults: Boolean = true,
@@ -217,9 +218,6 @@ data class SettingsUiState(
     val successMessage: String? = null
 )
 
-/**
- * UI state for provider settings
- */
 data class ProviderSettingsUiState(
     val name: String,
     val baseUrl: String,

@@ -6,175 +6,216 @@ import com.promptgenerator.domain.model.Response
 import com.promptgenerator.domain.repository.RequestRepository
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
+import kotlinx.atomicfu.atomic
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 class RequestRepositoryImpl(
     private val llmService: LLMService
 ) : RequestRepository {
     private val logger = LoggerFactory.getLogger(this::class.java)
-    private val isCancelled = AtomicBoolean(false)
+    private val isCancelled = atomic(false)
+    private val responsesMap = MutableStateFlow<Map<String, Response>>(emptyMap())
     private val pendingRetries = ConcurrentHashMap<String, Request>()
+    private val activeRequestIds = mutableSetOf<String>()
+    private val activeRequestsLock = Any()
 
     override fun sendRequests(
         requests: List<Request>,
         onProgress: suspend (requestId: String, responseContent: String, error: String?) -> Unit
     ): Flow<Map<String, Response>> = channelFlow {
+        if (requests.isEmpty()) {
+            send(emptyMap())
+            return@channelFlow
+        }
+
         logger.info("Sending ${requests.size} requests")
+        isCancelled.value = false
 
-        val responses = ConcurrentHashMap<String, Response>()
-        val pendingRequests = AtomicInteger(requests.size)
-        isCancelled.set(false)
+        responsesMap.value = emptyMap()
+        send(responsesMap.value)
 
-        try {
+        supervisorScope {
             val maxConcurrentRequests = llmService.getMaxConcurrentRequests()
             val semaphore = Semaphore(maxConcurrentRequests)
-            val activeJobs = mutableListOf<kotlinx.coroutines.Job>()
-            send(responses.toMap())
+            val completedCount = atomic(0)
+            val totalCount = requests.size
 
-            for (request in requests) {
-                if (isCancelled.get()) {
-                    logger.info("Request sending cancelled before starting request ${request.id}")
-                    break
-                }
+            try {
+                coroutineScope {
+                    for (request in requests) {
+                        if (!currentCoroutineContext().isActive || isCancelled.value) {
+                            break
+                        }
 
-                val job = launch {
-                    semaphore.withPermit {
-                        try {
-                            if (isCancelled.get()) {
-                                logger.info("Request sending cancelled for ${request.id} after acquiring permit")
-                                return@withPermit
-                            }
+                        launch {
+                            semaphore.withPermit {
+                                if (!currentCoroutineContext().isActive || isCancelled.value) {
+                                    return@withPermit
+                                }
 
-                            logger.debug("Sending request: ${request.id}")
+                                synchronized(activeRequestsLock) {
+                                    activeRequestIds.add(request.id)
+                                }
 
-                            try {
-                                val response = llmService.sendRequest(request)
+                                try {
+                                    logger.debug("Sending request: ${request.id}")
+                                    val response = llmService.sendRequest(request)
 
-                                responses[request.id] = response
+                                    responsesMap.update { current ->
+                                        val updated = current.toMutableMap()
+                                        updated[request.id] = response
+                                        updated
+                                    }
 
-                                if (response.error != null) {
+                                    if (response.error != null) {
+                                        pendingRetries[request.id] = request
+                                    }
+
+                                    onProgress(request.id, response.content, response.error)
+
+                                    if (currentCoroutineContext().isActive && !isCancelled.value) {
+                                        send(responsesMap.value)
+                                    }
+
+                                    val current = completedCount.incrementAndGet()
+                                    if (current >= totalCount) {
+                                        logger.info("All requests completed")
+                                        send(responsesMap.value)
+                                    }
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    if (!currentCoroutineContext().isActive || isCancelled.value) {
+                                        return@withPermit
+                                    }
+
+                                    logger.error("Error sending request: ${request.id}", e)
+
+                                    val errorResponse = Response(
+                                        id = request.id,
+                                        content = "",
+                                        error = "Error: ${e.message}"
+                                    )
+
+                                    responsesMap.update { current ->
+                                        val updated = current.toMutableMap()
+                                        updated[request.id] = errorResponse
+                                        updated
+                                    }
+
                                     pendingRetries[request.id] = request
+                                    onProgress(request.id, "", e.message)
+
+                                    if (currentCoroutineContext().isActive && !isCancelled.value) {
+                                        send(responsesMap.value)
+                                    }
+
+                                    val current = completedCount.incrementAndGet()
+                                    if (current >= totalCount) {
+                                        logger.info("All requests completed (with errors)")
+                                        send(responsesMap.value)
+                                    }
+                                } finally {
+                                    synchronized(activeRequestsLock) {
+                                        activeRequestIds.remove(request.id)
+                                    }
                                 }
-
-                                onProgress(request.id, response.content, response.error)
-                                if (!isCancelled.get()) {
-                                    send(responses.toMap())
-                                }
-
-                                if (pendingRequests.decrementAndGet() == 0) {
-                                    logger.info("All requests completed for generation")
-                                    send(responses.toMap())
-                                }
-
-                            } catch (e: Exception) {
-                                if (e is CancellationException) throw e
-
-                                logger.error("Error sending request: ${request.id}", e)
-
-                                val errorResponse = Response(
-                                    id = request.id,
-                                    content = "",
-                                    error = "Error: ${e.message}"
-                                )
-
-                                responses[request.id] = errorResponse
-                                pendingRetries[request.id] = request
-                                onProgress(request.id, "", e.message)
-
-                                if (!isCancelled.get()) {
-                                    send(responses.toMap())
-                                }
-
-                                if (pendingRequests.decrementAndGet() == 0) {
-                                    logger.info("All requests completed for generation (with errors)")
-                                    send(responses.toMap())
-                                }
-                            }
-                        } catch (e: CancellationException) {
-                            logger.info("Request ${request.id} was cancelled during execution")
-                            throw e
-                        } catch (e: Exception) {
-                            logger.error("Unexpected error processing request ${request.id}", e)
-                            if (pendingRequests.decrementAndGet() == 0) {
-                                send(responses.toMap())
                             }
                         }
                     }
                 }
-
-                activeJobs.add(job)
-            }
-            try {
-                for (job in activeJobs) {
-                    if (!job.isCompleted && !job.isCancelled) {
-                        job.join()
-                    }
-                }
             } catch (e: CancellationException) {
-                logger.info("Waiting for jobs was cancelled")
-                activeJobs.forEach { if (!it.isCompleted) it.cancel() }
+                logger.info("Request sending was cancelled, sending partial results")
+                send(responsesMap.value)
                 throw e
+            } catch (e: Exception) {
+                logger.error("Error sending requests", e)
+
+                requests
+                    .filter { !responsesMap.value.containsKey(it.id) }
+                    .forEach { request ->
+                        val errorResponse = Response(
+                            id = request.id,
+                            content = "",
+                            error = "Error: ${e.message}"
+                        )
+
+                        responsesMap.update { current ->
+                            val updated = current.toMutableMap()
+                            updated[request.id] = errorResponse
+                            updated
+                        }
+
+                        pendingRetries[request.id] = request
+                    }
+
+                send(responsesMap.value)
             }
-
-            logger.info("All jobs processed, sending final state with ${responses.size} responses")
-            send(responses.toMap())
-
-        } catch (e: CancellationException) {
-            logger.info("Request sending was cancelled, sending partial results")
-            send(responses.toMap())
-            throw e
-        } catch (e: Exception) {
-            logger.error("Error sending requests", e)
-
-            requests
-                .filter { !responses.containsKey(it.id) }
-                .forEach { request ->
-                    val errorResponse = Response(
-                        id = request.id,
-                        content = "",
-                        error = "Error: ${e.message}"
-                    )
-                    responses[request.id] = errorResponse
-                    pendingRetries[request.id] = request
-                }
-
-            send(responses.toMap())
         }
     }
         .onCompletion { cause ->
             logger.info("Flow completing with cause: $cause")
+
+            synchronized(activeRequestsLock) {
+                activeRequestIds.clear()
+            }
         }
         .flowOn(Dispatchers.IO)
 
     override suspend fun cancelRequests() {
         logger.info("Cancelling requests")
-        isCancelled.set(true)
+        isCancelled.value = true
         llmService.cancelRequests()
     }
 
-    override fun retryRequest(request: Request): Flow<Response> = channelFlow {
+    override fun retryRequest(request: Request): Flow<Response> = flow {
         logger.info("Retrying request: ${request.id}")
-        isCancelled.set(false)
+        isCancelled.value = false
         llmService.resetRetryCounter(request.id)
 
+        synchronized(activeRequestsLock) {
+            activeRequestIds.add(request.id)
+        }
+
         try {
-            val response = llmService.sendRequest(request)
+            val response = withTimeoutOrNull(300_000) {
+                llmService.sendRequest(request)
+            } ?: Response(
+                id = request.id,
+                content = "",
+                error = "Request timed out after 5 minutes"
+            )
+
             logger.info("Retry completed for request: ${request.id}")
-            send(response)
+            emit(response)
 
             if (response.error == null) {
                 pendingRetries.remove(request.id)
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             logger.error("Error retrying request: ${request.id}", e)
             val errorResponse = Response(
@@ -182,106 +223,122 @@ class RequestRepositoryImpl(
                 content = "",
                 error = "Error during retry: ${e.message}"
             )
-            send(errorResponse)
+            emit(errorResponse)
+        } finally {
+            synchronized(activeRequestsLock) {
+                activeRequestIds.remove(request.id)
+            }
         }
     }.flowOn(Dispatchers.IO)
 
     override fun retryFailedRequests(requests: List<Request>, existingResponses: Map<String, Response>): Flow<Map<String, Response>> = channelFlow {
         logger.info("Retrying ${requests.size} failed requests")
+        if (requests.isEmpty()) {
+            send(existingResponses)
+            return@channelFlow
+        }
 
-        val responses = ConcurrentHashMap<String, Response>(existingResponses)
-        val pendingRequests = AtomicInteger(requests.size)
-        isCancelled.set(false)
+        isCancelled.value = false
+        val responses = MutableStateFlow(existingResponses)
+        send(responses.value)
 
-        try {
+        supervisorScope {
             val maxConcurrentRequests = llmService.getMaxConcurrentRequests()
             val semaphore = Semaphore(maxConcurrentRequests)
-            val activeJobs = mutableListOf<kotlinx.coroutines.Job>()
+            val completedCount = atomic(0)
+            val totalCount = requests.size
 
-            requests.forEach { request ->
-                llmService.resetRetryCounter(request.id)
-            }
+            try {
+                coroutineScope {
+                    requests.forEach { request ->
+                        llmService.resetRetryCounter(request.id)
+                    }
 
-            send(responses.toMap())
+                    for (request in requests) {
+                        if (!currentCoroutineContext().isActive || isCancelled.value) {
+                            break
+                        }
 
-            for (request in requests) {
-                if (isCancelled.get()) {
-                    logger.info("Retry cancelled before starting request ${request.id}")
-                    break
-                }
-
-                val job = launch {
-                    semaphore.withPermit {
-                        try {
-                            if (isCancelled.get()) return@withPermit
-
-                            logger.debug("Retrying request: ${request.id}")
-
-                            try {
-                                val response = llmService.sendRequest(request)
-                                responses[request.id] = response
-
-                                if (response.error == null) {
-                                    pendingRetries.remove(request.id)
+                        launch {
+                            semaphore.withPermit {
+                                if (!currentCoroutineContext().isActive || isCancelled.value) {
+                                    return@withPermit
                                 }
 
-                                if (!isCancelled.get()) {
-                                    send(responses.toMap())
+                                synchronized(activeRequestsLock) {
+                                    activeRequestIds.add(request.id)
                                 }
 
-                                if (pendingRequests.decrementAndGet() == 0) {
-                                    logger.info("All retry requests completed")
-                                    send(responses.toMap())
-                                }
-                            } catch (e: Exception) {
-                                if (e is CancellationException) throw e
+                                try {
+                                    logger.debug("Retrying request: ${request.id}")
+                                    val response = llmService.sendRequest(request)
 
-                                logger.error("Error retrying request: ${request.id}", e)
-                                val errorResponse = Response(
-                                    id = request.id,
-                                    content = "",
-                                    error = "Error during retry: ${e.message}"
-                                )
-                                responses[request.id] = errorResponse
+                                    responses.update { current ->
+                                        val updated = current.toMutableMap()
+                                        updated[request.id] = response
+                                        updated
+                                    }
 
-                                if (!isCancelled.get()) {
-                                    send(responses.toMap())
-                                }
+                                    if (response.error == null) {
+                                        pendingRetries.remove(request.id)
+                                    }
 
-                                if (pendingRequests.decrementAndGet() == 0) {
-                                    logger.info("All retry requests completed (with errors)")
-                                    send(responses.toMap())
+                                    if (currentCoroutineContext().isActive && !isCancelled.value) {
+                                        send(responses.value)
+                                    }
+
+                                    val current = completedCount.incrementAndGet()
+                                    if (current >= totalCount) {
+                                        logger.info("All retry requests completed")
+                                        send(responses.value)
+                                    }
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    if (!currentCoroutineContext().isActive || isCancelled.value) {
+                                        return@withPermit
+                                    }
+
+                                    logger.error("Error retrying request: ${request.id}", e)
+
+                                    val errorResponse = Response(
+                                        id = request.id,
+                                        content = "",
+                                        error = "Error during retry: ${e.message}"
+                                    )
+
+                                    responses.update { current ->
+                                        val updated = current.toMutableMap()
+                                        updated[request.id] = errorResponse
+                                        updated
+                                    }
+
+                                    if (currentCoroutineContext().isActive && !isCancelled.value) {
+                                        send(responses.value)
+                                    }
+
+                                    val current = completedCount.incrementAndGet()
+                                    if (current >= totalCount) {
+                                        logger.info("All retry requests completed (with errors)")
+                                        send(responses.value)
+                                    }
+                                } finally {
+                                    synchronized(activeRequestsLock) {
+                                        activeRequestIds.remove(request.id)
+                                    }
                                 }
-                            }
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            logger.error("Unexpected error during retry for request ${request.id}", e)
-                            if (pendingRequests.decrementAndGet() == 0) {
-                                send(responses.toMap())
                             }
                         }
                     }
                 }
-
-                activeJobs.add(job)
+            } catch (e: CancellationException) {
+                logger.info("Retry cancelled, sending partial results")
+                send(responses.value)
+                throw e
+            } catch (e: Exception) {
+                logger.error("Error retrying requests", e)
+                send(responses.value)
             }
-
-            for (job in activeJobs) {
-                if (!job.isCompleted && !job.isCancelled) {
-                    job.join()
-                }
-            }
-
-            logger.info("All retry jobs processed")
-            send(responses.toMap())
-        } catch (e: CancellationException) {
-            logger.info("Retry cancelled, sending partial results")
-            send(responses.toMap())
-            throw e
-        } catch (e: Exception) {
-            logger.error("Error retrying requests", e)
-            send(responses.toMap())
         }
     }.flowOn(Dispatchers.IO)
 
@@ -290,8 +347,12 @@ class RequestRepositoryImpl(
     }
 
     override fun close() {
-        isCancelled.set(false)
+        isCancelled.value = false
         pendingRetries.clear()
         llmService.close()
+
+        synchronized(activeRequestsLock) {
+            activeRequestIds.clear()
+        }
     }
 }

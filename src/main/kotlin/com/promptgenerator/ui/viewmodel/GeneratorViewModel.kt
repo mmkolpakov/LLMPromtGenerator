@@ -22,11 +22,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
+import kotlinx.atomicfu.atomic
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.Closeable
 import java.io.File
 import java.util.UUID
@@ -40,37 +46,53 @@ class GeneratorViewModel(
     private val viewModelScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var generateJob: Job? = null
     private var stateUpdateJob: Job? = null
-    private var failedRequests = mutableMapOf<String, Request>()
+    private val failedRequests = mutableMapOf<String, Request>()
+    private val failedRequestsMutex = Mutex()
+    private val isUpdating = atomic(false)
 
     var uiState by mutableStateOf(GeneratorUiState())
         private set
 
     init {
-        val settings = settingsManager.getSettings()
-        val config = ConfigLoader.loadLLMConfig()
-
-        uiState = uiState.copy(
-            maxCombinations = settings.maxCombinations,
-            showPartialResults = settings.showPartialResults,
-            exportPath = settings.saveResultsPath,
-            systemPrompt = config.defaultSystemPrompt
-        )
-
+        loadSettings()
         startStateUpdateJob()
+    }
+
+    private fun loadSettings() {
+        try {
+            val settings = settingsManager.getSettings()
+            val config = ConfigLoader.loadLLMConfig()
+
+            uiState = uiState.copy(
+                maxCombinations = settings.maxCombinations,
+                showPartialResults = settings.showPartialResults,
+                exportPath = settings.saveResultsPath,
+                systemPrompt = config.defaultSystemPrompt
+            )
+        } catch (e: Exception) {
+            logger.error("Error loading settings", e)
+        }
     }
 
     private fun startStateUpdateJob() {
         stateUpdateJob?.cancel()
         stateUpdateJob = viewModelScope.launch {
-            promptGeneratorService.currentGenerationState
-                .distinctUntilChanged { old, new -> old == new }
-                .collectLatest { state ->
-                    if (state != null) {
-                        logger.info("Received generation state update: status=${state.status}, complete=${state.isComplete}, " +
-                                "progress=${state.completedCount}/${state.totalCount}")
-                        updateStateFromGeneration(state)
+            try {
+                promptGeneratorService.currentGenerationState
+                    .distinctUntilChanged { old, new -> old == new }
+                    .collectLatest { state ->
+                        if (state != null && !isUpdating.value) {
+                            logger.info("Received generation state update: status=${state.status}, complete=${state.isComplete}, " +
+                                    "progress=${state.completedCount}/${state.totalCount}")
+                            updateStateFromGeneration(state)
+                        }
                     }
-                }
+            } catch (e: Exception) {
+                logger.error("Error in state update job", e)
+                stateUpdateJob = null
+                delay(1000)
+                startStateUpdateJob()
+            }
         }
     }
 
@@ -111,15 +133,17 @@ class GeneratorViewModel(
     }
 
     fun addPlaceholder(customName: String = "") {
-        var placeholderName = if (customName.isNotBlank()) {
-            customName
+        val validName = customName.replace(Regex("[^a-zA-Z0-9_]"), "")
+        var placeholderName = if (validName.isNotBlank()) {
+            validName
         } else {
             "var${uiState.placeholderData.size + 1}"
         }
+
         var counter = 1
         while (uiState.placeholderData.containsKey(placeholderName)) {
-            placeholderName = if (customName.isNotBlank()) {
-                "${customName}${counter}"
+            placeholderName = if (validName.isNotBlank()) {
+                "${validName}${counter}"
             } else {
                 "var${uiState.placeholderData.size + counter}"
             }
@@ -190,6 +214,8 @@ class GeneratorViewModel(
             return
         }
 
+        isUpdating.value = true
+
         uiState = uiState.copy(
             errorMessage = null,
             networkError = null,
@@ -202,14 +228,17 @@ class GeneratorViewModel(
             uiState = uiState.copy(
                 errorMessage = "Template error: ${validation.errors.firstOrNull()}"
             )
+            isUpdating.value = false
             return
         }
+
         val placeholderData = prepareDataForGeneration(uiState.placeholderData)
 
         if (placeholderData.isEmpty() && validation.placeholders.isNotEmpty()) {
             uiState = uiState.copy(
                 errorMessage = "Template contains placeholders but no values provided"
             )
+            isUpdating.value = false
             return
         }
 
@@ -219,88 +248,129 @@ class GeneratorViewModel(
             content = uiState.templateContent
         )
 
-        failedRequests.clear()
+        viewModelScope.launch {
+            failedRequestsMutex.withLock {
+                failedRequests.clear()
+            }
 
-        uiState = uiState.copy(
-            isGenerating = true,
-            generationId = "",
-            errorMessage = null,
-            generationStatus = GenerationStatus.PREPARING,
-            generationProgress = 0f,
-            completedCount = 0,
-            totalCount = 0
-        )
+            uiState = uiState.copy(
+                isGenerating = true,
+                generationId = "",
+                errorMessage = null,
+                generationStatus = GenerationStatus.PREPARING,
+                generationProgress = 0f,
+                completedCount = 0,
+                totalCount = 0
+            )
 
-        generateJob?.cancel()
-        generateJob = viewModelScope.launch {
+            isUpdating.value = false
+
             try {
-                logger.info("Starting generation with system prompt: '${uiState.systemPrompt}'")
-                promptGeneratorService.generate(
-                    template = template,
-                    data = placeholderData,
-                    maxCombinations = uiState.maxCombinations,
-                    systemPrompt = uiState.systemPrompt
-                ).collect { state ->
-                    logger.info("Generation state update in flow: status=${state.status}, complete=${state.isComplete}")
-                    analyzeErrorsInResponses(state)
+                generateJob?.cancelAndJoin()
+                generateJob = viewModelScope.launch {
+                    try {
+                        logger.info("Starting generation with system prompt: '${uiState.systemPrompt}'")
+                        promptGeneratorService.generate(
+                            template = template,
+                            data = placeholderData,
+                            maxCombinations = uiState.maxCombinations,
+                            systemPrompt = uiState.systemPrompt
+                        )
+                            .catch { e ->
+                                logger.error("Error in generation flow", e)
+                                if (e !is CancellationException) {
+                                    updateUiAfterError(e as Exception)
+                                }
+                            }
+                            .collect { state ->
+                                logger.info("Generation state update in flow: status=${state.status}, complete=${state.isComplete}")
+                                analyzeErrorsInResponses(state)
+                            }
+                    } catch (e: CancellationException) {
+                        logger.info("Generation was cancelled")
+                        updateUiAfterCancellation()
+                    } catch (e: Exception) {
+                        logger.error("Error generating prompts", e)
+                        updateUiAfterError(e)
+                    }
                 }
-            } catch (_: CancellationException) {
-                logger.info("Generation was cancelled")
-                updateUiAfterCancellation()
             } catch (e: Exception) {
-                logger.error("Error generating prompts", e)
-                updateUiAfterError(e)
+                logger.error("Failed to launch generation job", e)
+                uiState = uiState.copy(
+                    isGenerating = false,
+                    errorMessage = "Failed to start generation: ${e.message}"
+                )
             }
         }
     }
 
-    private fun analyzeErrorsInResponses(state: GenerationState) {
+    private suspend fun analyzeErrorsInResponses(state: GenerationState) {
         val errorResponses = state.responses.filter { it.value.error != null }
-        if (errorResponses.isNotEmpty()) {
-            val errorPatterns = mapOf(
-                "timeout" to NetworkErrorType.TIMEOUT,
-                "timed out" to NetworkErrorType.TIMEOUT,
-                "rate limit" to NetworkErrorType.RATE_LIMIT,
-                "too many requests" to NetworkErrorType.RATE_LIMIT,
-                "unauthoriz" to NetworkErrorType.AUTHORIZATION,
-                "forbidden" to NetworkErrorType.AUTHORIZATION,
-                "api key" to NetworkErrorType.AUTHORIZATION,
-                "no api key" to NetworkErrorType.AUTHORIZATION,
-                "invalid api key" to NetworkErrorType.AUTHORIZATION,
-                "connection" to NetworkErrorType.CONNECTION,
-                "could not connect" to NetworkErrorType.CONNECTION,
-                "host" to NetworkErrorType.CONNECTION
+
+        if (errorResponses.isEmpty()) return
+
+        val errorPatterns = mapOf(
+            "timeout" to NetworkErrorType.TIMEOUT,
+            "timed out" to NetworkErrorType.TIMEOUT,
+            "rate limit" to NetworkErrorType.RATE_LIMIT,
+            "too many requests" to NetworkErrorType.RATE_LIMIT,
+            "unauthoriz" to NetworkErrorType.AUTHORIZATION,
+            "forbidden" to NetworkErrorType.AUTHORIZATION,
+            "api key" to NetworkErrorType.AUTHORIZATION,
+            "no api key" to NetworkErrorType.AUTHORIZATION,
+            "invalid api key" to NetworkErrorType.AUTHORIZATION,
+            "connection" to NetworkErrorType.CONNECTION,
+            "could not connect" to NetworkErrorType.CONNECTION,
+            "host" to NetworkErrorType.CONNECTION
+        )
+
+        val networkErrors = errorResponses.mapNotNull { (id, response) ->
+            val errorType = errorPatterns.entries.firstOrNull { (pattern, _) ->
+                response.error?.lowercase()?.contains(pattern) == true
+            }?.value ?: NetworkErrorType.UNKNOWN
+
+            NetworkError(
+                id = id,
+                message = response.error ?: "Unknown error",
+                type = errorType,
+                timestamp = System.currentTimeMillis()
+            )
+        }
+
+        if (networkErrors.isNotEmpty()) {
+            val primaryError = networkErrors.first()
+            uiState = uiState.copy(
+                networkError = primaryError
             )
 
-            val networkErrors = errorResponses.mapNotNull { (id, response) ->
-                val errorType = errorPatterns.entries.firstOrNull { (pattern, _) ->
-                    response.error?.lowercase()?.contains(pattern) == true
-                }?.value ?: NetworkErrorType.UNKNOWN
-
-                NetworkError(
-                    id = id,
-                    message = response.error ?: "Unknown error",
-                    type = errorType,
-                    timestamp = System.currentTimeMillis()
+            state.error?.let { error ->
+                val requests = promptGeneratorService.processTemplate(
+                    Template(
+                        id = UUID.randomUUID().toString(),
+                        name = "Error Template",
+                        content = error
+                    ),
+                    emptyMap()
                 )
+
+                failedRequestsMutex.withLock {
+                    requests.forEach { request ->
+                        failedRequests[request.id] = request
+                    }
+                }
             }
 
-            if (networkErrors.isNotEmpty()) {
-                val primaryError = networkErrors.first()
-                uiState = uiState.copy(
-                    networkError = primaryError
-                )
-
-                state.error?.let { error ->
-                    promptGeneratorService.processTemplate(
-                        Template(
-                            id = UUID.randomUUID().toString(),
-                            name = "Error Template",
-                            content = error
-                        ),
-                        emptyMap()
-                    ).forEach { request ->
-                        failedRequests[request.id] = request
+            failedRequestsMutex.withLock {
+                errorResponses.forEach { (id, response) ->
+                    state.responses.keys.find { it == id }?.let { responseId ->
+                        state.template.let { template ->
+                            val requestContent = if (response.content.isBlank()) response.error ?: "" else response.content
+                            failedRequests[responseId] = Request(
+                                id = responseId,
+                                content = requestContent,
+                                systemInstruction = uiState.systemPrompt
+                            )
+                        }
                     }
                 }
             }
@@ -310,18 +380,24 @@ class GeneratorViewModel(
     private fun prepareDataForGeneration(placeholderData: Map<String, String>): Map<String, Any> {
         return placeholderData.filter { (_, value) -> value.isNotBlank() }
             .mapValues { (_, value) ->
-                if (value.trim().startsWith("[") && value.trim().endsWith("]")) {
-                    val listContent = value.trim().removeSurrounding("[", "]")
-                    parseListValues(listContent)
-                } else if (value.contains(",")) {
-                    parseListValues(value)
-                } else {
-                    value
+                when {
+                    value.trim().startsWith("[") && value.trim().endsWith("]") -> {
+                        val listContent = value.trim().removeSurrounding("[", "]")
+                        parseListValues(listContent)
+                    }
+                    value.contains(",") -> {
+                        parseListValues(value)
+                    }
+                    else -> {
+                        value
+                    }
                 }
             }
     }
 
     private fun parseListValues(input: String): List<String> {
+        if (input.isBlank()) return emptyList()
+
         val result = mutableListOf<String>()
         var current = StringBuilder()
         var inQuotes = false
@@ -356,8 +432,10 @@ class GeneratorViewModel(
         }
     }
 
-    private fun updateStateFromGeneration(state: GenerationState) {
+    private suspend fun updateStateFromGeneration(state: GenerationState) {
         try {
+            isUpdating.value = true
+
             if (uiState.generationId.isEmpty() || state.id == uiState.generationId) {
                 val finalResponses = if (state.isComplete && state.status == GenerationStatus.COMPLETED) {
                     state.responses
@@ -395,6 +473,8 @@ class GeneratorViewModel(
             }
         } catch (e: Exception) {
             logger.error("Error updating state from generation", e)
+        } finally {
+            isUpdating.value = false
         }
     }
 
@@ -451,7 +531,7 @@ class GeneratorViewModel(
         val placeholderData = mutableMapOf<String, String>()
 
         newPlaceholders.forEach { placeholder ->
-            placeholderData[placeholder] = ""
+            placeholderData[placeholder] = uiState.placeholderData[placeholder] ?: ""
         }
 
         uiState = uiState.copy(
@@ -553,7 +633,11 @@ class GeneratorViewModel(
             successMessage = null,
             networkError = null
         )
-        failedRequests.clear()
+        viewModelScope.launch {
+            failedRequestsMutex.withLock {
+                failedRequests.clear()
+            }
+        }
     }
 
     fun clearMessage() {
@@ -578,6 +662,7 @@ class GeneratorViewModel(
                 if (!exportDir.exists()) {
                     exportDir.mkdirs()
                 }
+
                 val serializablePlaceholders = uiState.placeholderData.mapValues { (_, value) ->
                     if (value.contains(",")) {
                         value.split(",").map { it.trim() }
@@ -632,10 +717,16 @@ class GeneratorViewModel(
             showPartialResults = newValue
         )
 
-        val settings = settingsManager.getSettings()
-        settingsManager.updateSettings(settings.copy(
-            showPartialResults = newValue
-        ))
+        viewModelScope.launch {
+            try {
+                val settings = settingsManager.getSettings()
+                settingsManager.updateSettings(settings.copy(
+                    showPartialResults = newValue
+                ))
+            } catch (e: Exception) {
+                logger.error("Error updating showPartialResults setting", e)
+            }
+        }
     }
 
     fun updateMaxCombinations(maxCombinations: Int) {
@@ -643,26 +734,38 @@ class GeneratorViewModel(
             maxCombinations = maxCombinations
         )
 
-        val settings = settingsManager.getSettings()
-        settingsManager.updateSettings(settings.copy(
-            maxCombinations = maxCombinations
-        ))
+        viewModelScope.launch {
+            try {
+                val settings = settingsManager.getSettings()
+                settingsManager.updateSettings(settings.copy(
+                    maxCombinations = maxCombinations
+                ))
+            } catch (e: Exception) {
+                logger.error("Error updating maxCombinations setting", e)
+            }
+        }
     }
 
     fun retryFailedRequests() {
-        if (failedRequests.isEmpty()) return
-
         viewModelScope.launch {
-            val requestsToRetry = failedRequests.toMap()
-            failedRequests.clear()
-
-            uiState = uiState.copy(
-                networkError = null,
-                isGenerating = true,
-                generationStatus = GenerationStatus.SENDING_REQUESTS
-            )
-
             try {
+                val requestsToRetry = failedRequestsMutex.withLock {
+                    failedRequests.values.toList().also {
+                        failedRequests.clear()
+                    }
+                }
+
+                if (requestsToRetry.isEmpty()) {
+                    logger.info("No failed requests to retry")
+                    return@launch
+                }
+
+                uiState = uiState.copy(
+                    networkError = null,
+                    isGenerating = true,
+                    generationStatus = GenerationStatus.SENDING_REQUESTS
+                )
+
                 val template = Template(
                     id = uiState.templateId,
                     name = uiState.templateName,
@@ -671,7 +774,7 @@ class GeneratorViewModel(
 
                 promptGeneratorService.retryRequests(
                     template = template,
-                    requests = requestsToRetry.values.toList(),
+                    requests = requestsToRetry,
                     existingResponses = uiState.results + uiState.partialResponses
                 )
             } catch (e: Exception) {
@@ -685,17 +788,20 @@ class GeneratorViewModel(
     }
 
     fun retryFailedRequest(requestId: String) {
-        val request = failedRequests[requestId] ?: return
-
         viewModelScope.launch {
-            failedRequests.remove(requestId)
-
-            uiState = uiState.copy(
-                isGenerating = true,
-                generationStatus = GenerationStatus.SENDING_REQUESTS
-            )
-
             try {
+                val request = failedRequestsMutex.withLock {
+                    failedRequests.remove(requestId)
+                } ?: run {
+                    logger.warn("Request $requestId not found in failed requests")
+                    return@launch
+                }
+
+                uiState = uiState.copy(
+                    isGenerating = true,
+                    generationStatus = GenerationStatus.SENDING_REQUESTS
+                )
+
                 val template = Template(
                     id = uiState.templateId,
                     name = uiState.templateName,

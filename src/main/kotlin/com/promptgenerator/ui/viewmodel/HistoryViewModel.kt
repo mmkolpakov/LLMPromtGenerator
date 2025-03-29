@@ -9,6 +9,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
@@ -19,8 +21,8 @@ class HistoryViewModel(
 ) : Closeable {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val viewModelScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var resultsJob: Job? = null
 
-    // UI state
     var uiState by mutableStateOf(HistoryUiState())
         private set
 
@@ -28,23 +30,36 @@ class HistoryViewModel(
         loadResults()
     }
 
-    /**
-     * Loads generation results
-     */
     private fun loadResults() {
-        viewModelScope.launch {
-            manageResultsUseCase.getAllResults().collectLatest { results ->
+        resultsJob?.cancel()
+        resultsJob = viewModelScope.launch {
+            uiState = uiState.copy(isLoading = true)
+
+            try {
+                manageResultsUseCase.getAllResults()
+                    .catch { e ->
+                        logger.error("Error loading results", e)
+                        uiState = uiState.copy(
+                            isLoading = false,
+                            errorMessage = "Failed to load results: ${e.message}"
+                        )
+                    }
+                    .collectLatest { results ->
+                        uiState = uiState.copy(
+                            results = results,
+                            isLoading = false
+                        )
+                    }
+            } catch (e: Exception) {
+                logger.error("Error starting results flow", e)
                 uiState = uiState.copy(
-                    results = results,
-                    isLoading = false
+                    isLoading = false,
+                    errorMessage = "Failed to load results: ${e.message}"
                 )
             }
         }
     }
 
-    /**
-     * Views result details
-     */
     fun viewResultDetails(resultId: String) {
         viewModelScope.launch {
             uiState = uiState.copy(
@@ -67,9 +82,6 @@ class HistoryViewModel(
         }
     }
 
-    /**
-     * Closes result details dialog
-     */
     fun closeDetailsDialog() {
         uiState = uiState.copy(
             showDetailsDialog = false,
@@ -78,9 +90,6 @@ class HistoryViewModel(
         )
     }
 
-    /**
-     * Exports result to files
-     */
     fun exportResult(result: GenerationResult, directory: String = "generated_prompts") {
         viewModelScope.launch {
             try {
@@ -104,16 +113,12 @@ class HistoryViewModel(
         }
     }
 
-    /**
-     * Deletes a result
-     */
     fun deleteResult(resultId: String) {
         viewModelScope.launch {
             try {
                 manageResultsUseCase.deleteResult(resultId)
                     .onSuccess { success ->
                         if (success) {
-                            // Result will be removed from the flow and UI updated automatically
                             uiState = uiState.copy(
                                 successMessage = "Result deleted successfully",
                                 showDetailsDialog = false,
@@ -140,9 +145,6 @@ class HistoryViewModel(
         }
     }
 
-    /**
-     * Clears error or success message
-     */
     fun clearMessage() {
         uiState = uiState.copy(
             errorMessage = null,
@@ -150,17 +152,12 @@ class HistoryViewModel(
         )
     }
 
-    /**
-     * Releases resources
-     */
     override fun close() {
-        // No resources to release
+        resultsJob?.cancel()
+        viewModelScope.cancel()
     }
 }
 
-/**
- * UI state for history screen
- */
 data class HistoryUiState(
     val results: List<GenerationResult> = emptyList(),
     val isLoading: Boolean = true,

@@ -9,70 +9,79 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.UUID
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlin.io.path.createDirectories
+import kotlin.io.path.exists
 
-/**
- * Local data source for templates
- */
 class TemplateLocalDataSource(
     private val templatesDir: String = "templates"
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val json = Json { prettyPrint = true }
 
+    private val templatesMutex = Mutex()
     private val templates = mutableMapOf<String, Template>()
     private val templatesFlow = MutableStateFlow<List<Template>>(emptyList())
 
     init {
+        ensureDirectoryExists()
         loadTemplates()
     }
 
-    /**
-     * Saves template to local storage
-     */
-    suspend fun saveTemplate(template: Template): Template {
+    private fun ensureDirectoryExists() {
+        try {
+            val dir = Path.of(templatesDir)
+            if (!dir.exists()) {
+                dir.createDirectories()
+                logger.info("Created templates directory: $templatesDir")
+            }
+        } catch (e: Exception) {
+            logger.error("Failed to create templates directory: $templatesDir", e)
+        }
+    }
+
+    suspend fun saveTemplate(template: Template): Template = templatesMutex.withLock {
         val templateToSave = if (template.id.isBlank()) {
             template.copy(id = UUID.randomUUID().toString())
         } else {
             template
         }
 
-        // Store in memory
         templates[templateToSave.id] = templateToSave
 
-        // Update flow
-        templatesFlow.value = templates.values.toList()
+        updateTemplatesFlow()
 
-        // Save to file
         saveTemplateToFile(templateToSave)
 
         return templateToSave
     }
 
-    /**
-     * Gets template by ID
-     */
-    suspend fun getTemplate(id: String): Template? = templates[id]
+    suspend fun getTemplate(id: String): Template? = templatesMutex.withLock {
+        templates[id]
+    }
 
-    /**
-     * Gets all templates
-     */
     fun getAllTemplates(): Flow<List<Template>> = templatesFlow.asStateFlow()
 
-    /**
-     * Deletes template by ID
-     */
-    suspend fun deleteTemplate(id: String): Boolean {
+    suspend fun deleteTemplate(id: String): Boolean = templatesMutex.withLock {
         val template = templates.remove(id)
 
         if (template != null) {
-            // Update flow
-            templatesFlow.value = templates.values.toList()
+            updateTemplatesFlow()
 
-            // Delete file
-            val file = File(File(templatesDir), "$id.json")
+            val file = File(templatesDir, "$id.json")
             if (file.exists()) {
-                file.delete()
+                try {
+                    if (!file.delete()) {
+                        logger.warn("Failed to delete template file: ${file.absolutePath}")
+                    }
+                } catch (e: Exception) {
+                    logger.error("Error deleting template file: ${file.name}", e)
+                }
             }
 
             return true
@@ -81,9 +90,6 @@ class TemplateLocalDataSource(
         return false
     }
 
-    /**
-     * Loads templates from storage
-     */
     private fun loadTemplates() {
         val dir = File(templatesDir)
         if (!dir.exists()) {
@@ -93,28 +99,31 @@ class TemplateLocalDataSource(
 
         dir.listFiles { file -> file.extension == "json" }?.forEach { file ->
             try {
-                val content = file.readText()
-                val templateDto = json.decodeFromString<TemplateDto>(content)
+                file.inputStream().bufferedReader().use { reader ->
+                    val content = reader.readText()
+                    val templateDto = json.decodeFromString<TemplateDto>(content)
 
-                val template = Template(
-                    id = templateDto.id,
-                    name = templateDto.name,
-                    content = templateDto.content,
-                    description = templateDto.description
-                )
+                    val template = Template(
+                        id = templateDto.id,
+                        name = templateDto.name,
+                        content = templateDto.content,
+                        description = templateDto.description
+                    )
 
-                templates[template.id] = template
+                    templates[template.id] = template
+                }
             } catch (e: Exception) {
                 logger.error("Error loading template from ${file.name}", e)
             }
         }
 
+        updateTemplatesFlow()
+    }
+
+    private fun updateTemplatesFlow() {
         templatesFlow.value = templates.values.toList()
     }
 
-    /**
-     * Saves template to file
-     */
     private fun saveTemplateToFile(template: Template) {
         try {
             val dir = File(templatesDir)
@@ -130,16 +139,32 @@ class TemplateLocalDataSource(
             )
 
             val file = File(dir, "${template.id}.json")
-            val content = json.encodeToString(templateDto)
-            file.writeText(content)
+            val tempFile = File(dir, "${template.id}.json.tmp")
+
+            tempFile.outputStream().bufferedWriter().use { writer ->
+                val content = json.encodeToString(templateDto)
+                writer.write(content)
+            }
+
+            if (tempFile.length() > 0) {
+                if (file.exists()) {
+                    file.delete()
+                }
+
+                if (!tempFile.renameTo(file)) {
+                    Files.move(tempFile.toPath(), file.toPath())
+                }
+            } else {
+                tempFile.delete()
+                throw IOException("Failed to write template to file (empty file)")
+            }
+
         } catch (e: Exception) {
             logger.error("Error saving template to file", e)
+            throw e
         }
     }
 
-    /**
-     * DTO for template serialization
-     */
     @Serializable
     private data class TemplateDto(
         val id: String,
