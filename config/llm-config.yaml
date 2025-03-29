@@ -1,35 +1,45 @@
-# LLM provider configuration
-defaultProvider: gemini
+defaultProvider: "gemini"
+defaultSystemPrompt: "You are a helpful AI assistant tasked with generating responses\
+  \ based on the provided template. Respond only with the output based on the template\
+  \ and variables provided. Do not add any explanations, introductions, or additional\
+  \ text outside the template structure."
 providers:
-  openai:
-    baseUrl: https://api.openai.com
+  "openai":
+    baseUrl: "https://api.openai.com"
     apiKey: "YOUR_API_KEY"
-    defaultModel: gpt-4o
+    port: 0
+    protocol: "https"
+    defaultModel: "gpt-4o"
     rateLimiting:
       requestsPerMinute: 60
       maxConcurrent: 5
       retryDelay: 1000
-  anthropic:
-    baseUrl: https://api.anthropic.com
+  "anthropic":
+    baseUrl: "https://api.anthropic.com"
     apiKey: "YOUR_API_KEY"
-    defaultModel: claude-3-sonnet-20240229
+    port: 0
+    protocol: "https"
+    defaultModel: "claude-3-sonnet-20240229"
     rateLimiting:
       requestsPerMinute: 60
       maxConcurrent: 5
       retryDelay: 1000
-  gemini:
-    baseUrl: https://generativelanguage.googleapis.com
+  "gemini":
+    baseUrl: "https://generativelanguage.googleapis.com"
     apiKey: "YOUR_API_KEY"
-    defaultModel: gemini-1.5-flash
+    port: 0
+    protocol: "https"
+    defaultModel: "gemini-1.5-flash"
     rateLimiting:
       requestsPerMinute: 60
       maxConcurrent: 5
       retryDelay: 1000
-  ollama:
-    protocol: http
-    baseUrl: localhost
+  "ollama":
+    baseUrl: "localhost"
+    apiKey: ""
     port: 11434
-    defaultModel: llama2
+    protocol: "http"
+    defaultModel: "llama2"
     rateLimiting:
       requestsPerMinute: 300
       maxConcurrent: 10

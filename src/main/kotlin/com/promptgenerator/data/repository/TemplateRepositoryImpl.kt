@@ -10,7 +10,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.regex.Pattern
 import kotlin.math.min
 
@@ -27,22 +26,26 @@ class TemplateRepositoryImpl(
         systemInstruction: String?
     ): List<Request> {
         logger.debug("Processing template: '${template.name}'")
+        logger.info("Processing template with data: $data")
 
         if (template.content.isBlank()) {
+            logger.warn("Template content is blank, returning empty request")
             return listOf(Request(UUID.randomUUID().toString(), "", systemInstruction))
         }
 
         val placeholders = extractPlaceholders(template.content)
+        logger.info("Found ${placeholders.size} placeholders in template: $placeholders")
 
         if (placeholders.isEmpty()) {
-            logger.debug("No placeholders found")
+            logger.debug("No placeholders found, returning template as is")
             return listOf(Request(UUID.randomUUID().toString(), template.content, systemInstruction))
         }
 
         val relevantData = data.filterKeys { placeholders.contains(it) }
+        logger.info("Relevant data for placeholders: $relevantData")
 
         if (relevantData.isEmpty()) {
-            logger.warn("No data provided for any placeholders")
+            logger.warn("No data provided for any placeholders, returning template as is")
             return listOf(Request(UUID.randomUUID().toString(), template.content, systemInstruction))
         }
 
@@ -59,24 +62,89 @@ class TemplateRepositoryImpl(
 
         val missingPlaceholders = placeholders.filter { !placeholderValues.containsKey(it) }
         for (placeholder in missingPlaceholders) {
-            logger.warn("No data provided for placeholder: $placeholder")
+            logger.warn("No data provided for placeholder: $placeholder - will use empty string")
         }
 
-        return getCombinationsSequence(placeholderValues, maxCombinations)
-            .map { combination ->
-                var content = template.content
-                for ((placeholder, value) in combination) {
-                    content = content.replace("{{$placeholder}}", value.toString())
-                }
+        logger.info("Generating combinations with placeholderValues: $placeholderValues")
 
-                val remainingPlaceholders = extractPlaceholders(content)
-                if (remainingPlaceholders.isNotEmpty()) {
-                    logger.warn("Template still contains un-replaced placeholders: $remainingPlaceholders")
-                }
+        val requests = generateCombinations(template, placeholderValues, maxCombinations, systemInstruction)
+        logger.info("Generated ${requests.size} requests from template")
 
-                Request(UUID.randomUUID().toString(), content, systemInstruction)
+        return requests
+    }
+
+    private fun generateCombinations(
+        template: Template,
+        placeholderValues: Map<String, List<Any>>,
+        maxCombinations: Int,
+        systemInstruction: String?
+    ): List<Request> {
+        if (placeholderValues.isEmpty()) {
+            return listOf(Request(UUID.randomUUID().toString(), template.content, systemInstruction))
+        }
+
+        val placeholderKeys = placeholderValues.keys.toList()
+        val maxSizes = placeholderKeys.map { placeholderValues[it]?.size ?: 1 }
+
+        // Calculate total combinations with overflow protection
+        var totalCombinations = 1L
+        for (size in maxSizes) {
+            if (size > 0) {
+                val newTotal = totalCombinations * size
+                if (newTotal / size != totalCombinations) {
+                    // Overflow occurred
+                    totalCombinations = Long.MAX_VALUE
+                    break
+                }
+                totalCombinations = newTotal
             }
-            .toList()
+        }
+
+        val limitedCombinations = min(totalCombinations, maxCombinations.toLong())
+        logger.info("Generating $limitedCombinations combinations (out of $totalCombinations possible)")
+
+        val result = mutableListOf<Request>()
+        val indices = IntArray(placeholderKeys.size) { 0 }
+        var combinationCount = 0L
+
+        while (combinationCount < limitedCombinations) {
+            val combination = placeholderKeys.withIndex().associate { (i, key) ->
+                val values = placeholderValues[key] ?: emptyList<Any>()
+                if (values.isEmpty()) {
+                    key to ""
+                } else {
+                    key to (values[indices[i]] ?: "")
+                }
+            }
+
+            var content = template.content
+            for ((placeholder, value) in combination) {
+                content = content.replace("{{$placeholder}}", value.toString())
+            }
+
+            result.add(Request(UUID.randomUUID().toString(), content, systemInstruction))
+            combinationCount++
+
+            var incrementIndex = placeholderKeys.size - 1
+            while (incrementIndex >= 0) {
+                val valueList = placeholderValues[placeholderKeys[incrementIndex]] ?: emptyList<Any>()
+                val size = valueList.size.coerceAtLeast(1)
+
+                indices[incrementIndex] = (indices[incrementIndex] + 1) % size
+
+                if (indices[incrementIndex] != 0) {
+                    break
+                }
+
+                incrementIndex--
+            }
+
+            if (incrementIndex < 0) {
+                break
+            }
+        }
+
+        return result
     }
 
     private fun processPlaceholderValues(
@@ -145,56 +213,6 @@ class TemplateRepositoryImpl(
                 value.substring(1, value.length - 1)
             } else {
                 value
-            }
-        }
-    }
-
-    private fun getCombinationsSequence(
-        placeholderValues: Map<String, List<*>>,
-        maxCombinations: Int
-    ): Sequence<Map<String, Any>> = sequence {
-        if (placeholderValues.isEmpty()) {
-            yield(emptyMap())
-            return@sequence
-        }
-
-        val placeholderKeys = placeholderValues.keys.toList()
-        val maxSizes = placeholderKeys.map { placeholderValues[it]?.size ?: 1 }
-        val totalCombinations = maxSizes.fold(1L) { acc, size -> acc * size }
-
-        val limitedCombinations = min(totalCombinations, maxCombinations.toLong())
-        logger.info("Generating $limitedCombinations combinations (out of $totalCombinations possible)")
-
-        val indices = IntArray(placeholderKeys.size) { 0 }
-        var combinationCount = 0L
-
-        while (combinationCount < limitedCombinations) {
-            val combination = placeholderKeys.withIndex().associate { (i, key) ->
-                val values = placeholderValues[key] ?: emptyList<Any>()
-                if (values.isEmpty()) {
-                    key to ""
-                } else {
-                    key to (values[indices[i]] ?: "")
-                }
-            }
-
-            yield(combination)
-            combinationCount++
-
-            var incrementIndex = placeholderKeys.size - 1
-            while (incrementIndex >= 0) {
-                val valueList = placeholderValues[placeholderKeys[incrementIndex]] ?: emptyList<Any>()
-                indices[incrementIndex] = (indices[incrementIndex] + 1) % valueList.size.coerceAtLeast(1)
-
-                if (indices[incrementIndex] != 0) {
-                    break
-                }
-
-                incrementIndex--
-            }
-
-            if (incrementIndex < 0) {
-                break
             }
         }
     }

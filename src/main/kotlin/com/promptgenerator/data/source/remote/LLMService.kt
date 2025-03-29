@@ -1,30 +1,18 @@
 package com.promptgenerator.data.source.remote
 
-import com.promptgenerator.config.ConfigLoader
 import com.promptgenerator.config.LLMConfig
 import com.promptgenerator.config.ProviderConfig
 import com.promptgenerator.domain.model.NetworkError
 import com.promptgenerator.domain.model.NetworkErrorType
 import com.promptgenerator.domain.model.Request
 import com.promptgenerator.domain.model.Response
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.launch
+import kotlinx.atomicfu.atomic
+import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import org.slf4j.LoggerFactory
-import kotlinx.atomicfu.atomic
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
-import kotlin.time.Duration.Companion.milliseconds
 
 class LLMService(
     private val config: LLMConfig = LLMConfig(),
@@ -34,10 +22,13 @@ class LLMService(
     private val activeRequests = ConcurrentHashMap.newKeySet<String>()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    private val clientsMutex = Mutex()
+    private val rateLimitingMutex = Mutex()
+    private val jobsMutex = Mutex()
+
     private val providerName: String = config.defaultProvider
     private val providerConfig: ProviderConfig
     private val clients = ConcurrentHashMap<String, LLMClient>()
-    private val rateLimitingMutex = Mutex()
     private val requestTimestamps = mutableListOf<Long>()
     private val maxRequestsPerMinute: Int
     private val maxConcurrentRequests: Int
@@ -60,7 +51,36 @@ class LLMService(
         modelName = providerConfig.defaultModel
 
         try {
-            getOrCreateClient(providerName)
+            clients.computeIfAbsent(providerName) { name ->
+                val provCfg = config.providers[name]
+                    ?: throw IllegalStateException("Provider not found: $name")
+
+                if (provCfg.apiKey.isBlank() && !name.equals("ollama", ignoreCase = true)) {
+                    throw IllegalStateException("API key missing for provider: $name")
+                }
+
+                when (name.lowercase()) {
+                    "openai" -> {
+                        OpenAIClient(provCfg, config.requestDefaults)
+                    }
+                    "anthropic" -> {
+                        AnthropicClient(provCfg, config.requestDefaults)
+                    }
+                    "gemini" -> {
+                        GeminiClient(provCfg, config.requestDefaults)
+                    }
+                    "ollama" -> {
+                        val ollamaConfig = provCfg.copy(
+                            baseUrl = "${provCfg.protocol}://${provCfg.baseUrl}:${provCfg.port}"
+                        )
+                        OpenAIClient(ollamaConfig, config.requestDefaults)
+                    }
+                    else -> {
+                        logger.error("Provider $name is not supported")
+                        throw IllegalArgumentException("Unsupported LLM provider: $name")
+                    }
+                }
+            }
             logger.info("LLM Service initialized with model: $modelName and system prompt configured")
         } catch (e: Exception) {
             logger.error("Failed to initialize client for provider $providerName", e)
@@ -72,7 +92,7 @@ class LLMService(
 
     fun getSystemPrompt(): String = systemPrompt
 
-    private fun getOrCreateClient(providerName: String): LLMClient {
+    private suspend fun getOrCreateClient(providerName: String): LLMClient = clientsMutex.withLock {
         return clients.computeIfAbsent(providerName) { name ->
             val providerConfig = config.providers[name]
                 ?: throw IllegalStateException("Provider not found: $name")
@@ -158,12 +178,16 @@ class LLMService(
                     }
                 }
             } finally {
-                activeRequests.remove(request.id)
-                activeJobs.remove(request.id)
+                jobsMutex.withLock {
+                    activeRequests.remove(request.id)
+                    activeJobs.remove(request.id)
+                }
             }
         }
 
-        activeJobs[request.id] = job
+        jobsMutex.withLock {
+            activeJobs[request.id] = job
+        }
 
         try {
             if (isCancelled.value) {
@@ -234,7 +258,9 @@ class LLMService(
                 error = formatErrorMessage(error, remainingAttempts)
             )
         } finally {
-            activeRequests.remove(request.id)
+            jobsMutex.withLock {
+                activeRequests.remove(request.id)
+            }
         }
     }
 
@@ -303,16 +329,22 @@ class LLMService(
         logger.info("Cancelling all requests (${activeRequests.size} active)")
         isCancelled.value = true
 
-        clients.values.forEach { client ->
-            try {
-                client.cancelRequests()
-            } catch (e: Exception) {
-                logger.error("Error cancelling requests in client", e)
+        scope.launch {
+            clientsMutex.withLock {
+                clients.values.forEach { client ->
+                    try {
+                        client.cancelRequests()
+                    } catch (e: Exception) {
+                        logger.error("Error cancelling requests in client", e)
+                    }
+                }
             }
-        }
 
-        activeJobs.values.forEach { job ->
-            job.cancel()
+            jobsMutex.withLock {
+                activeJobs.values.forEach { job ->
+                    job.cancel()
+                }
+            }
         }
 
         logger.info("All requests cancellation initiated")
@@ -326,17 +358,21 @@ class LLMService(
         isCancelled.value = false
 
         scope.launch {
-            clients.values.forEach { client ->
-                try {
-                    client.close()
-                } catch (e: Exception) {
-                    logger.error("Error closing client", e)
+            clientsMutex.withLock {
+                clients.values.forEach { client ->
+                    try {
+                        client.close()
+                    } catch (e: Exception) {
+                        logger.error("Error closing client", e)
+                    }
                 }
             }
-        }
 
-        activeJobs.values.forEach { job ->
-            job.cancel()
+            jobsMutex.withLock {
+                activeJobs.values.forEach { job ->
+                    job.cancel()
+                }
+            }
         }
 
         clients.clear()

@@ -49,6 +49,7 @@ class GeneratorViewModel(
     private val failedRequests = ConcurrentHashMap<String, Request>()
     private val isUpdating = atomic(false)
     private val stateMutex = Mutex()
+    private val placeholderMutex = Mutex()
 
     var uiState by mutableStateOf(GeneratorUiState())
         private set
@@ -79,7 +80,11 @@ class GeneratorViewModel(
         stateUpdateJob = viewModelScope.launch {
             try {
                 promptGeneratorService.currentGenerationState
-                    .distinctUntilChanged { old, new -> old == new }
+                    .distinctUntilChanged { old, new ->
+                        old?.status == new?.status &&
+                                old?.completedCount == new?.completedCount &&
+                                old?.isComplete == new?.isComplete
+                    }
                     .collectLatest { state ->
                         if (state != null && !isUpdating.value) {
                             logger.info("Received generation state update: status=${state.status}, complete=${state.isComplete}, " +
@@ -100,113 +105,150 @@ class GeneratorViewModel(
         viewModelScope.launch {
             try {
                 manageTemplatesUseCase.getAllTemplates().collect { templates ->
-                    uiState = uiState.copy(templates = templates)
+                    updateUiState { currentState ->
+                        currentState.copy(templates = templates)
+                    }
                     logger.info("Loaded ${templates.size} templates")
                 }
             } catch (e: Exception) {
                 logger.error("Error loading templates", e)
-                uiState = uiState.copy(
-                    errorMessage = "Error loading templates: ${e.message}"
-                )
+                updateUiState { currentState ->
+                    currentState.copy(errorMessage = "Error loading templates: ${e.message}")
+                }
             }
         }
     }
 
     fun updateTemplateContent(content: String) {
-        uiState = uiState.copy(
-            templateContent = content,
-            templateValidation = validateTemplate(content)
-        )
+        viewModelScope.launch {
+            val validation = validateTemplate(content)
+            updateUiState { currentState ->
+                currentState.copy(
+                    templateContent = content,
+                    templateValidation = validation
+                )
+            }
+        }
     }
 
     fun updateSystemPrompt(systemPrompt: String) {
-        uiState = uiState.copy(
-            systemPrompt = systemPrompt
-        )
+        viewModelScope.launch {
+            updateUiState { currentState ->
+                currentState.copy(systemPrompt = systemPrompt)
+            }
+        }
     }
 
     fun updatePlaceholderData(key: String, value: String) {
-        val updatedData = uiState.placeholderData.toMutableMap().apply {
-            this[key] = value
+        viewModelScope.launch {
+            placeholderMutex.withLock {
+                val updatedData = uiState.placeholderData.toMutableMap().apply {
+                    this[key] = value
+                }
+                updateUiState { currentState ->
+                    currentState.copy(placeholderData = updatedData)
+                }
+            }
         }
-        uiState = uiState.copy(placeholderData = updatedData)
     }
 
     fun addPlaceholder(customName: String = "") {
-        if (uiState.placeholderData.isNotEmpty() &&
-            customName.contains("var")) {
-            return
-        }
+        viewModelScope.launch {
+            placeholderMutex.withLock {
+                val validName = customName.replace(Regex("[^a-zA-Z0-9_]"), "")
 
-        val validName = customName.replace(Regex("[^a-zA-Z0-9_]"), "")
-        var placeholderName = if (validName.isNotBlank()) {
-            validName
-        } else {
-            "var${uiState.placeholderData.size + 1}"
-        }
+                if (customName.isNotBlank() && customName.contains("var") &&
+                    uiState.placeholderData.isNotEmpty()) {
+                    return@withLock
+                }
 
-        var counter = 1
-        while (uiState.placeholderData.containsKey(placeholderName)) {
-            placeholderName = if (validName.isNotBlank()) {
-                "${validName}${counter}"
-            } else {
-                "var${uiState.placeholderData.size + counter}"
+                var placeholderName = if (validName.isNotBlank()) {
+                    validName
+                } else {
+                    "var${uiState.placeholderData.size + 1}"
+                }
+
+                var counter = 1
+                while (uiState.placeholderData.containsKey(placeholderName)) {
+                    placeholderName = if (validName.isNotBlank()) {
+                        "${validName}${counter}"
+                    } else {
+                        "var${uiState.placeholderData.size + counter}"
+                    }
+                    counter++
+                }
+
+                val updatedData = uiState.placeholderData.toMutableMap().apply {
+                    this[placeholderName] = ""
+                }
+                updateUiState { currentState ->
+                    currentState.copy(placeholderData = updatedData)
+                }
             }
-            counter++
         }
-
-        val updatedData = uiState.placeholderData.toMutableMap().apply {
-            this[placeholderName] = ""
-        }
-        uiState = uiState.copy(placeholderData = updatedData)
     }
 
     fun addDetectedPlaceholder(name: String) {
-        if (!uiState.placeholderData.containsKey(name)) {
-            val updatedData = uiState.placeholderData.toMutableMap().apply {
-                this[name] = ""
+        viewModelScope.launch {
+            placeholderMutex.withLock {
+                if (!uiState.placeholderData.containsKey(name)) {
+                    val updatedData = uiState.placeholderData.toMutableMap().apply {
+                        this[name] = ""
+                    }
+                    updateUiState { currentState ->
+                        currentState.copy(placeholderData = updatedData)
+                    }
+                }
             }
-            uiState = uiState.copy(placeholderData = updatedData)
         }
     }
 
     fun removePlaceholder(key: String) {
-        val updatedData = uiState.placeholderData.toMutableMap().apply {
-            remove(key)
-        }
+        viewModelScope.launch {
+            placeholderMutex.withLock {
+                val updatedData = uiState.placeholderData.toMutableMap().apply {
+                    remove(key)
+                }
 
-        val finalData = if (updatedData.isEmpty()) {
-            mapOf("var1" to "")
-        } else {
-            updatedData
+                updateUiState { currentState ->
+                    currentState.copy(placeholderData = updatedData)
+                }
+            }
         }
-
-        uiState = uiState.copy(placeholderData = finalData)
     }
 
     fun renamePlaceholder(oldName: String, newName: String) {
-        if (oldName == newName) return
+        viewModelScope.launch {
+            placeholderMutex.withLock {
+                if (oldName == newName) return@withLock
 
-        if (uiState.placeholderData.containsKey(newName)) {
-            uiState = uiState.copy(
-                errorMessage = "A variable with name '$newName' already exists"
-            )
-            return
+                if (uiState.placeholderData.containsKey(newName)) {
+                    updateUiState { currentState ->
+                        currentState.copy(
+                            errorMessage = "A variable with name '$newName' already exists"
+                        )
+                    }
+                    return@withLock
+                }
+
+                val value = uiState.placeholderData[oldName] ?: ""
+                val updatedData = uiState.placeholderData.toMutableMap().apply {
+                    remove(oldName)
+                    put(newName, value)
+                }
+
+                val updatedTemplate = uiState.templateContent.replace("{{$oldName}}", "{{$newName}}")
+                val validation = validateTemplate(updatedTemplate)
+
+                updateUiState { currentState ->
+                    currentState.copy(
+                        placeholderData = updatedData,
+                        templateContent = updatedTemplate,
+                        templateValidation = validation
+                    )
+                }
+            }
         }
-
-        val value = uiState.placeholderData[oldName] ?: ""
-        val updatedData = uiState.placeholderData.toMutableMap().apply {
-            remove(oldName)
-            put(newName, value)
-        }
-
-        val updatedTemplate = uiState.templateContent.replace("{{$oldName}}", "{{$newName}}")
-
-        uiState = uiState.copy(
-            placeholderData = updatedData,
-            templateContent = updatedTemplate,
-            templateValidation = validateTemplate(updatedTemplate)
-        )
     }
 
     private fun validateTemplate(content: String): ValidationResult {
@@ -219,89 +261,129 @@ class GeneratorViewModel(
             return
         }
 
-        isUpdating.value = true
+        logger.info("Generate button clicked, starting generation process")
 
-        uiState = uiState.copy(
-            errorMessage = null,
-            networkError = null,
-            results = emptyMap(),
-            partialResponses = emptyMap()
-        )
-
-        val validation = validateTemplate(uiState.templateContent)
-        if (!validation.isValid) {
-            uiState = uiState.copy(
-                errorMessage = "Template error: ${validation.errors.firstOrNull()}"
-            )
-            isUpdating.value = false
-            return
-        }
-
-        val placeholderData = prepareDataForGeneration(uiState.placeholderData)
-
-        if (placeholderData.isEmpty() && validation.placeholders.isNotEmpty()) {
-            uiState = uiState.copy(
-                errorMessage = "Template contains placeholders but no values provided"
-            )
-            isUpdating.value = false
-            return
-        }
-
-        val template = Template(
-            id = uiState.templateId.ifBlank { UUID.randomUUID().toString() },
-            name = uiState.templateName.ifBlank { "Untitled Template" },
-            content = uiState.templateContent
-        )
+        logger.info("Current template content: '${uiState.templateContent}'")
+        logger.info("Placeholder data: ${uiState.placeholderData}")
 
         viewModelScope.launch {
-            failedRequests.clear()
-
-            uiState = uiState.copy(
-                isGenerating = true,
-                generationId = "",
-                errorMessage = null,
-                generationStatus = GenerationStatus.PREPARING,
-                generationProgress = 0f,
-                completedCount = 0,
-                totalCount = 0
-            )
-
-            isUpdating.value = false
-
             try {
-                generateJob?.cancel()
-                generateJob = viewModelScope.launch {
-                    try {
-                        logger.info("Starting generation with system prompt: '${uiState.systemPrompt}'")
-                        promptGeneratorService.generate(
-                            template = template,
-                            data = placeholderData,
-                            maxCombinations = uiState.maxCombinations,
-                            systemPrompt = uiState.systemPrompt
+                stateMutex.withLock {
+                    isUpdating.value = true
+
+                    logger.info("Setting up generation state")
+                    val validation = validateTemplate(uiState.templateContent)
+                    val placeholders = promptGeneratorService.extractPlaceholders(uiState.templateContent)
+                    logger.info("Template has ${placeholders.size} placeholders: $placeholders")
+
+                    if (!validation.isValid) {
+                        logger.warn("Template validation failed: ${validation.errors.firstOrNull()}")
+                        updateUiState { currentState ->
+                            currentState.copy(
+                                errorMessage = "Template error: ${validation.errors.firstOrNull()}"
+                            )
+                        }
+                        isUpdating.value = false
+                        return@withLock
+                    }
+
+                    updateUiState { currentState ->
+                        currentState.copy(
+                            errorMessage = null,
+                            networkError = null,
+                            results = emptyMap(),
+                            partialResponses = emptyMap()
                         )
-                            .catch { e ->
-                                logger.error("Error in generation flow", e)
-                                if (e !is CancellationException) {
-                                    updateUiAfterError(e as Exception)
-                                }
+                    }
+
+                    val placeholderData = prepareDataForGeneration(uiState.placeholderData)
+                    logger.info("Placeholder data prepared: ${placeholderData.keys}")
+
+                    if (placeholderData.isEmpty()) {
+                        logger.warn("No values provided for any placeholders")
+                        updateUiState { currentState ->
+                            currentState.copy(
+                                errorMessage = "Please provide at least one placeholder value"
+                            )
+                        }
+                        isUpdating.value = false
+                        return@withLock
+                    }
+
+                    val missingPlaceholders = placeholders.filter { !placeholderData.containsKey(it) }
+                    if (missingPlaceholders.isNotEmpty()) {
+                        logger.warn("Some placeholders have no values: $missingPlaceholders")
+                    }
+
+                    val template = Template(
+                        id = uiState.templateId.ifBlank { UUID.randomUUID().toString() },
+                        name = uiState.templateName.ifBlank { "Untitled Template" },
+                        content = uiState.templateContent
+                    )
+
+                    logger.info("Starting generation with template: '${template.name}', placeholder count: ${placeholderData.size}")
+
+                    failedRequests.clear()
+
+                    updateUiState { currentState ->
+                        currentState.copy(
+                            isGenerating = true,
+                            generationId = "",
+                            errorMessage = null,
+                            generationStatus = GenerationStatus.PREPARING,
+                            generationProgress = 0f,
+                            completedCount = 0,
+                            totalCount = 0
+                        )
+                    }
+
+                    isUpdating.value = false
+
+                    try {
+                        generateJob?.cancel()
+                        generateJob = launch {
+                            logger.info("Launch generation job")
+                            try {
+                                logger.info("Calling promptGeneratorService.generate()")
+                                promptGeneratorService.generate(
+                                    template = template,
+                                    data = placeholderData,
+                                    maxCombinations = uiState.maxCombinations,
+                                    systemPrompt = uiState.systemPrompt
+                                )
+                                    .catch { e ->
+                                        logger.error("Error in generation flow", e)
+                                        if (e !is CancellationException) {
+                                            updateUiAfterError(e as Exception)
+                                        }
+                                    }
+                                    .collect { state ->
+                                        logger.info("Generation state update: status=${state.status}, complete=${state.isComplete}")
+                                        analyzeErrorsInResponses(state)
+                                    }
+                            } catch (e: CancellationException) {
+                                logger.info("Generation was cancelled")
+                                updateUiAfterCancellation()
+                            } catch (e: Exception) {
+                                logger.error("Error generating prompts", e)
+                                updateUiAfterError(e)
                             }
-                            .collect { state ->
-                                logger.info("Generation state update in flow: status=${state.status}, complete=${state.isComplete}")
-                                analyzeErrorsInResponses(state)
-                            }
-                    } catch (e: CancellationException) {
-                        logger.info("Generation was cancelled")
-                        updateUiAfterCancellation()
+                        }
                     } catch (e: Exception) {
-                        logger.error("Error generating prompts", e)
-                        updateUiAfterError(e)
+                        logger.error("Failed to launch generation job", e)
+                        updateUiState { currentState ->
+                            currentState.copy(
+                                isGenerating = false,
+                                errorMessage = "Failed to start generation: ${e.message}"
+                            )
+                        }
                     }
                 }
             } catch (e: Exception) {
-                logger.error("Failed to launch generation job", e)
+                logger.error("Unexpected error starting generation", e)
                 uiState = uiState.copy(
                     isGenerating = false,
-                    errorMessage = "Failed to start generation: ${e.message}"
+                    errorMessage = "Error starting generation: ${e.message}"
                 )
             }
         }
@@ -342,15 +424,18 @@ class GeneratorViewModel(
 
         if (networkErrors.isNotEmpty()) {
             val primaryError = networkErrors.first()
-            uiState = uiState.copy(
-                networkError = primaryError
-            )
+            updateUiState { currentState ->
+                currentState.copy(networkError = primaryError)
+            }
 
-            // Save all failed requests for retry
             errorResponses.forEach { (id, response) ->
                 state.responses.keys.find { it == id }?.let { responseId ->
                     state.template.let { template ->
-                        val requestContent = if (response.content.isBlank()) response.error ?: "" else response.content
+                        val requestContent = if (response.content.isBlank()) {
+                            template.content
+                        } else {
+                            response.content
+                        }
                         failedRequests[responseId] = Request(
                             id = responseId,
                             content = requestContent,
@@ -417,46 +502,36 @@ class GeneratorViewModel(
         }
     }
 
-    private suspend fun updateStateFromGeneration(state: GenerationState) {
+    private suspend fun updateStateFromGeneration(state: GenerationState) = stateMutex.withLock {
         try {
             isUpdating.value = true
 
-            stateMutex.withLock {
-                if (uiState.generationId.isEmpty() || state.id == uiState.generationId) {
-                    val finalResponses = if (state.isComplete && state.status == GenerationStatus.COMPLETED) {
-                        state.responses
-                    } else if (uiState.results.isNotEmpty()) {
-                        uiState.results
-                    } else {
-                        emptyMap()
-                    }
+            if (uiState.generationId.isEmpty() || state.id == uiState.generationId) {
+                var updatedState = uiState.copy(
+                    generationId = state.id,
+                    isGenerating = !state.isComplete,
+                    generationStatus = state.status,
+                    generationProgress = state.progress,
+                    completedCount = state.completedCount,
+                    totalCount = state.totalCount,
+                    errorMessage = state.error
+                )
 
-                    val partialResponses = if (!state.isComplete || state.status == GenerationStatus.CANCELLED) {
-                        state.responses
-                    } else {
-                        uiState.partialResponses
-                    }
-
-                    uiState = uiState.copy(
-                        generationId = state.id,
-                        isGenerating = !state.isComplete,
-                        generationStatus = state.status,
-                        generationProgress = state.progress,
-                        partialResponses = partialResponses,
-                        completedCount = state.completedCount,
-                        totalCount = state.totalCount,
-                        errorMessage = state.error
+                if (state.isComplete) {
+                    updatedState = updatedState.copy(
+                        isGenerating = false,
+                        results = if (state.status == GenerationStatus.COMPLETED) state.responses else uiState.results,
+                        partialResponses = if (state.status != GenerationStatus.COMPLETED) state.responses else uiState.partialResponses
                     )
 
-                    if (state.isComplete) {
-                        uiState = uiState.copy(
-                            isGenerating = false,
-                            results = if (state.status == GenerationStatus.COMPLETED) state.responses else finalResponses
-                        )
-
-                        logger.info("Generation complete with status: ${state.status}")
-                    }
+                    logger.info("Generation complete with status: ${state.status}")
+                } else {
+                    updatedState = updatedState.copy(
+                        partialResponses = state.responses
+                    )
                 }
+
+                uiState = updatedState
             }
         } catch (e: Exception) {
             logger.error("Error updating state from generation", e)
@@ -465,20 +540,32 @@ class GeneratorViewModel(
         }
     }
 
+    private suspend fun updateUiState(update: (GeneratorUiState) -> GeneratorUiState) = stateMutex.withLock {
+        uiState = update(uiState)
+    }
+
     private fun updateUiAfterCancellation() {
-        uiState = uiState.copy(
-            isGenerating = false,
-            generationStatus = GenerationStatus.CANCELLED,
-            errorMessage = "Generation cancelled"
-        )
+        viewModelScope.launch {
+            updateUiState { currentState ->
+                currentState.copy(
+                    isGenerating = false,
+                    generationStatus = GenerationStatus.CANCELLED,
+                    errorMessage = "Generation cancelled"
+                )
+            }
+        }
     }
 
     private fun updateUiAfterError(error: Exception) {
-        uiState = uiState.copy(
-            isGenerating = false,
-            generationStatus = GenerationStatus.ERROR,
-            errorMessage = "Error: ${error.message}"
-        )
+        viewModelScope.launch {
+            updateUiState { currentState ->
+                currentState.copy(
+                    isGenerating = false,
+                    generationStatus = GenerationStatus.ERROR,
+                    errorMessage = "Error: ${error.message}"
+                )
+            }
+        }
     }
 
     fun saveCurrentTemplate(name: String) {
@@ -492,77 +579,51 @@ class GeneratorViewModel(
                 )
 
                 manageTemplatesUseCase.updateTemplate(template).onSuccess { savedTemplate ->
-                    uiState = uiState.copy(
-                        templateId = savedTemplate.id,
-                        templateName = savedTemplate.name,
-                        successMessage = "Template saved successfully"
-                    )
+                    updateUiState { currentState ->
+                        currentState.copy(
+                            templateId = savedTemplate.id,
+                            templateName = savedTemplate.name,
+                            successMessage = "Template saved successfully"
+                        )
+                    }
                     loadAllTemplates()
 
                 }.onFailure { error ->
-                    uiState = uiState.copy(
-                        errorMessage = "Failed to save template: ${error.message}"
-                    )
+                    updateUiState { currentState ->
+                        currentState.copy(
+                            errorMessage = "Failed to save template: ${error.message}"
+                        )
+                    }
                 }
             } catch (e: Exception) {
                 logger.error("Error saving template", e)
-                uiState = uiState.copy(
-                    errorMessage = "Error saving template: ${e.message}"
-                )
+                updateUiState { currentState ->
+                    currentState.copy(
+                        errorMessage = "Error saving template: ${e.message}"
+                    )
+                }
             }
         }
     }
 
     fun loadTemplateDirectly(template: Template) {
-        val newPlaceholders = promptGeneratorService.extractPlaceholders(template.content)
-        val placeholderData = mutableMapOf<String, String>()
-
-        newPlaceholders.forEach { placeholder ->
-            placeholderData[placeholder] = uiState.placeholderData[placeholder] ?: ""
-        }
-
-        if (placeholderData.isEmpty() && newPlaceholders.isEmpty()) {
-            placeholderData["var1"] = ""
-        }
-
-        uiState = uiState.copy(
-            templateId = template.id,
-            templateName = template.name,
-            templateContent = template.content,
-            placeholderData = placeholderData,
-            templateValidation = validateTemplate(template.content),
-            successMessage = "Template loaded successfully"
-        )
-    }
-
-    fun loadTemplate(templateId: String, updatePlaceholders: Boolean = false) {
         viewModelScope.launch {
-            try {
-                manageTemplatesUseCase.getTemplate(templateId).onSuccess { template ->
-                    val newPlaceholders = promptGeneratorService.extractPlaceholders(template.content)
-                    val placeholderData = if (updatePlaceholders) {
-                        if (newPlaceholders.isEmpty()) {
-                            mapOf("var1" to "")
-                        } else {
-                            newPlaceholders.associateWith { "" }
-                        }
-                    } else {
-                        val currentPlaceholders = uiState.placeholderData.toMutableMap()
+            placeholderMutex.withLock {
+                val newPlaceholders = promptGeneratorService.extractPlaceholders(template.content)
+                val placeholderData = mutableMapOf<String, String>()
 
-                        if (newPlaceholders.isNotEmpty()) {
-                            newPlaceholders.forEach { placeholder ->
-                                if (!currentPlaceholders.containsKey(placeholder)) {
-                                    currentPlaceholders[placeholder] = ""
-                                }
-                            }
-                        } else if (currentPlaceholders.isEmpty()) {
-                            currentPlaceholders["var1"] = ""
-                        }
+                newPlaceholders.forEach { placeholder ->
+                    placeholderData[placeholder] = uiState.placeholderData[placeholder] ?: ""
+                }
 
-                        currentPlaceholders
+                if (placeholderData.isEmpty() && newPlaceholders.isNotEmpty()) {
+                    newPlaceholders.forEach { placeholder ->
+                        placeholderData[placeholder] = ""
                     }
+                }
 
-                    uiState = uiState.copy(
+                updateUiState { currentState ->
+                    currentState.copy(
                         templateId = template.id,
                         templateName = template.name,
                         templateContent = template.content,
@@ -570,84 +631,146 @@ class GeneratorViewModel(
                         templateValidation = validateTemplate(template.content),
                         successMessage = "Template loaded successfully"
                     )
-                }.onFailure { error ->
-                    uiState = uiState.copy(
-                        errorMessage = "Failed to load template: ${error.message}"
-                    )
+                }
+            }
+        }
+    }
+
+    fun loadTemplate(templateId: String, updatePlaceholders: Boolean = false) {
+        viewModelScope.launch {
+            try {
+                placeholderMutex.withLock {
+                    manageTemplatesUseCase.getTemplate(templateId).onSuccess { template ->
+                        val newPlaceholders = promptGeneratorService.extractPlaceholders(template.content)
+                        val placeholderData = if (updatePlaceholders) {
+                            newPlaceholders.associateWith { "" }
+                        } else {
+                            val currentPlaceholders = uiState.placeholderData.toMutableMap()
+
+                            newPlaceholders.forEach { placeholder ->
+                                if (!currentPlaceholders.containsKey(placeholder)) {
+                                    currentPlaceholders[placeholder] = ""
+                                }
+                            }
+
+                            currentPlaceholders
+                        }
+
+                        updateUiState { currentState ->
+                            currentState.copy(
+                                templateId = template.id,
+                                templateName = template.name,
+                                templateContent = template.content,
+                                placeholderData = placeholderData,
+                                templateValidation = validateTemplate(template.content),
+                                successMessage = "Template loaded successfully"
+                            )
+                        }
+                    }.onFailure { error ->
+                        updateUiState { currentState ->
+                            currentState.copy(
+                                errorMessage = "Failed to load template: ${error.message}"
+                            )
+                        }
+                    }
                 }
             } catch (e: Exception) {
                 logger.error("Error loading template", e)
-                uiState = uiState.copy(
-                    errorMessage = "Error loading template: ${e.message}"
-                )
+                updateUiState { currentState ->
+                    currentState.copy(
+                        errorMessage = "Error loading template: ${e.message}"
+                    )
+                }
             }
         }
     }
 
     fun createNewTemplate() {
-        uiState = uiState.copy(
-            templateId = "",
-            templateName = "Untitled Template",
-            templateContent = "",
-            placeholderData = mapOf("var1" to ""),
-            templateValidation = ValidationResult(true),
-            results = emptyMap(),
-            partialResponses = emptyMap()
-        )
+        viewModelScope.launch {
+            updateUiState { currentState ->
+                currentState.copy(
+                    templateId = "",
+                    templateName = "Untitled Template",
+                    templateContent = "",
+                    placeholderData = emptyMap(),
+                    templateValidation = ValidationResult(true),
+                    results = emptyMap(),
+                    partialResponses = emptyMap()
+                )
+            }
+        }
     }
 
     fun cancelGeneration() {
         viewModelScope.launch {
             try {
                 logger.info("Cancelling generation from ViewModel")
-                uiState = uiState.copy(
-                    generationStatus = GenerationStatus.CANCELLED,
-                    errorMessage = "Cancelling generation..."
-                )
+                updateUiState { currentState ->
+                    currentState.copy(
+                        generationStatus = GenerationStatus.CANCELLED,
+                        errorMessage = "Cancelling generation..."
+                    )
+                }
                 withContext(Dispatchers.IO) {
                     promptGeneratorService.cancelGeneration()
                 }
                 generateJob?.cancel()
-                uiState = uiState.copy(
-                    isGenerating = false,
-                    generationStatus = GenerationStatus.CANCELLED,
-                    errorMessage = "Generation cancelled"
-                )
+                updateUiState { currentState ->
+                    currentState.copy(
+                        isGenerating = false,
+                        generationStatus = GenerationStatus.CANCELLED,
+                        errorMessage = "Generation cancelled"
+                    )
+                }
 
                 logger.info("Generation cancelled successfully")
             } catch (e: Exception) {
                 logger.error("Error cancelling generation", e)
-                uiState = uiState.copy(
-                    isGenerating = false,
-                    generationStatus = GenerationStatus.CANCELLED,
-                    errorMessage = "Error cancelling generation: ${e.message}"
-                )
+                updateUiState { currentState ->
+                    currentState.copy(
+                        isGenerating = false,
+                        generationStatus = GenerationStatus.CANCELLED,
+                        errorMessage = "Error cancelling generation: ${e.message}"
+                    )
+                }
             }
         }
     }
 
     fun clearResults() {
-        uiState = uiState.copy(
-            results = emptyMap(),
-            partialResponses = emptyMap(),
-            errorMessage = null,
-            successMessage = null,
-            networkError = null
-        )
-        failedRequests.clear()
+        viewModelScope.launch {
+            updateUiState { currentState ->
+                currentState.copy(
+                    results = emptyMap(),
+                    partialResponses = emptyMap(),
+                    errorMessage = null,
+                    successMessage = null,
+                    networkError = null
+                )
+            }
+            failedRequests.clear()
+        }
     }
 
     fun clearMessage() {
-        uiState = uiState.copy(
-            errorMessage = null,
-            successMessage = null
-        )
+        viewModelScope.launch {
+            updateUiState { currentState ->
+                currentState.copy(
+                    errorMessage = null,
+                    successMessage = null
+                )
+            }
+        }
     }
 
     fun clearNetworkError() {
-        uiState = uiState.copy(
-            networkError = null
-        )
+        viewModelScope.launch {
+            updateUiState { currentState ->
+                currentState.copy(
+                    networkError = null
+                )
+            }
+        }
     }
 
     fun exportResults() {
@@ -687,22 +810,28 @@ class GeneratorViewModel(
                 promptGeneratorService.exportResults(result, exportPath)
                     .onSuccess { files ->
                         logger.info("Successfully exported ${files.size} files to $exportPath")
-                        uiState = uiState.copy(
-                            successMessage = "Exported ${files.size} results to $exportPath",
-                            exportPath = exportPath
-                        )
+                        updateUiState { currentState ->
+                            currentState.copy(
+                                successMessage = "Exported ${files.size} results to $exportPath",
+                                exportPath = exportPath
+                            )
+                        }
                     }
                     .onFailure { error ->
                         logger.error("Failed to export results: ${error.message}", error)
-                        uiState = uiState.copy(
-                            errorMessage = "Failed to export results: ${error.message}"
-                        )
+                        updateUiState { currentState ->
+                            currentState.copy(
+                                errorMessage = "Failed to export results: ${error.message}"
+                            )
+                        }
                     }
             } catch (e: Exception) {
                 logger.error("Error exporting results", e)
-                uiState = uiState.copy(
-                    errorMessage = "Error exporting results: ${e.message}"
-                )
+                updateUiState { currentState ->
+                    currentState.copy(
+                        errorMessage = "Error exporting results: ${e.message}"
+                    )
+                }
             }
         }
     }
@@ -710,11 +839,13 @@ class GeneratorViewModel(
     fun toggleShowPartialResults() {
         val newValue = !uiState.showPartialResults
 
-        uiState = uiState.copy(
-            showPartialResults = newValue
-        )
-
         viewModelScope.launch {
+            updateUiState { currentState ->
+                currentState.copy(
+                    showPartialResults = newValue
+                )
+            }
+
             try {
                 val settings = settingsManager.getSettings()
                 settingsManager.updateSettings(settings.copy(
@@ -727,11 +858,13 @@ class GeneratorViewModel(
     }
 
     fun updateMaxCombinations(maxCombinations: Int) {
-        uiState = uiState.copy(
-            maxCombinations = maxCombinations
-        )
-
         viewModelScope.launch {
+            updateUiState { currentState ->
+                currentState.copy(
+                    maxCombinations = maxCombinations
+                )
+            }
+
             try {
                 val settings = settingsManager.getSettings()
                 settingsManager.updateSettings(settings.copy(
@@ -754,11 +887,13 @@ class GeneratorViewModel(
                     return@launch
                 }
 
-                uiState = uiState.copy(
-                    networkError = null,
-                    isGenerating = true,
-                    generationStatus = GenerationStatus.SENDING_REQUESTS
-                )
+                updateUiState { currentState ->
+                    currentState.copy(
+                        networkError = null,
+                        isGenerating = true,
+                        generationStatus = GenerationStatus.SENDING_REQUESTS
+                    )
+                }
 
                 val template = Template(
                     id = uiState.templateId,
@@ -773,10 +908,12 @@ class GeneratorViewModel(
                 )
             } catch (e: Exception) {
                 logger.error("Error retrying failed requests", e)
-                uiState = uiState.copy(
-                    errorMessage = "Error retrying requests: ${e.message}",
-                    isGenerating = false
-                )
+                updateUiState { currentState ->
+                    currentState.copy(
+                        errorMessage = "Error retrying requests: ${e.message}",
+                        isGenerating = false
+                    )
+                }
             }
         }
     }
@@ -789,10 +926,12 @@ class GeneratorViewModel(
                     return@launch
                 }
 
-                uiState = uiState.copy(
-                    isGenerating = true,
-                    generationStatus = GenerationStatus.SENDING_REQUESTS
-                )
+                updateUiState { currentState ->
+                    currentState.copy(
+                        isGenerating = true,
+                        generationStatus = GenerationStatus.SENDING_REQUESTS
+                    )
+                }
 
                 val template = Template(
                     id = uiState.templateId,
@@ -807,10 +946,12 @@ class GeneratorViewModel(
                 )
             } catch (e: Exception) {
                 logger.error("Error retrying failed request", e)
-                uiState = uiState.copy(
-                    errorMessage = "Error retrying request: ${e.message}",
-                    isGenerating = false
-                )
+                updateUiState { currentState ->
+                    currentState.copy(
+                        errorMessage = "Error retrying request: ${e.message}",
+                        isGenerating = false
+                    )
+                }
             }
         }
     }
@@ -827,7 +968,7 @@ data class GeneratorUiState(
     val templateId: String = "",
     val templateName: String = "Untitled Template",
     val templateContent: String = "",
-    val placeholderData: Map<String, String> = mapOf("var1" to ""),
+    val placeholderData: Map<String, String> = emptyMap(),
     val templateValidation: ValidationResult = ValidationResult(true),
     val systemPrompt: String = "You are a helpful AI assistant tasked with generating responses based on the provided template. Respond only with the output based on the template and variables provided. Do not add any explanations, introductions, or additional text outside the template structure.",
     val templates: List<Template> = emptyList(),

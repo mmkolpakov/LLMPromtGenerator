@@ -33,6 +33,7 @@ import org.slf4j.LoggerFactory
 import java.util.UUID
 import kotlinx.atomicfu.atomic
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.channelFlow
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.system.measureTimeMillis
 
@@ -81,6 +82,8 @@ class PromptGeneratorService(
         val generationId = UUID.randomUUID().toString()
         isCancellationRequested.value = false
 
+        logger.info("Starting new generation with ID: $generationId, template: ${template.name}, data: $data")
+
         val initialState = GenerationState(
             id = generationId,
             template = template,
@@ -95,222 +98,98 @@ class PromptGeneratorService(
 
         _currentGenerationState.value = initialState
 
-        val stateFlow = MutableStateFlow(initialState)
+        return channelFlow {
+            send(initialState)
 
-        logger.info("Starting generation $generationId")
+            logger.info("Creating requests from template with ${data.size} placeholder values")
 
-        val job = scope.launch {
+            val updatedState = initialState.copy(status = GenerationStatus.PROCESSING_TEMPLATE)
+            _currentGenerationState.value = updatedState
+            send(updatedState)
+
             try {
-                stateFlow.update { it.copy(status = GenerationStatus.PROCESSING_TEMPLATE) }
-                _currentGenerationState.value = stateFlow.value
+                logger.info("Calling templateRepository.processTemplate")
+                val requests = templateRepository.processTemplate(
+                    template,
+                    data,
+                    maxCombinations,
+                    systemPrompt
+                )
+                logger.info("Received ${requests.size} requests from template processing")
 
-                val processingTime = measureTimeMillis {
-                    val requests = templateRepository.processTemplate(
-                        template,
-                        data,
-                        maxCombinations,
-                        systemPrompt
-                    )
-
-                    if (requests.isEmpty()) {
-                        logger.info("No requests generated from template for $generationId")
-                        stateFlow.update {
-                            it.copy(
-                                status = GenerationStatus.COMPLETED,
-                                error = "No requests generated from template",
-                                isComplete = true
-                            )
-                        }
-                        _currentGenerationState.value = stateFlow.value
-                        return@launch
-                    }
-
-                    if (isCancellationRequested.value) {
-                        throw CancellationException("Generation was cancelled after template processing")
-                    }
-
-                    stateFlow.update {
-                        it.copy(
-                            status = GenerationStatus.SENDING_REQUESTS,
-                            totalCount = requests.size
-                        )
-                    }
-                    _currentGenerationState.value = stateFlow.value
-
-                    val responses = ConcurrentHashMap<String, Response>()
-
-                    try {
-                        withTimeout(600_000) {
-                            requestRepository.sendRequests(requests) { requestId, content, error ->
-                                val response = Response(requestId, content, error)
-                                responses[requestId] = response
-
-                                stateFlow.update {
-                                    it.copy(
-                                        responses = responses.toMap(),
-                                        completedCount = responses.size
-                                    )
-                                }
-                                _currentGenerationState.value = stateFlow.value
-                            }
-                                .flowOn(Dispatchers.IO)
-                                .onStart {
-                                    logger.info("Starting request processing for generation $generationId")
-                                }
-                                .onEach { latestResponses ->
-                                    if (isCancellationRequested.value) {
-                                        throw CancellationException("Generation was cancelled during processing")
-                                    }
-
-                                    logger.info("Received update with ${latestResponses.size} responses for generation $generationId")
-
-                                    stateFlow.update {
-                                        it.copy(
-                                            responses = latestResponses,
-                                            completedCount = latestResponses.size
-                                        )
-                                    }
-                                    _currentGenerationState.value = stateFlow.value
-
-                                    if (latestResponses.size == requests.size) {
-                                        logger.info("All responses received for generation $generationId")
-                                    }
-                                }
-                                .onCompletion { cause ->
-                                    logger.info("Request flow completed for generation $generationId, cause: $cause")
-
-                                    if (cause != null && cause !is CancellationException) {
-                                        logger.error("Error during request processing for $generationId", cause)
-                                    }
-                                }
-                                .catch { e ->
-                                    logger.error("Exception in request stream for $generationId", e)
-
-                                    if (e is CancellationException) throw e
-
-                                    stateFlow.update {
-                                        it.copy(
-                                            status = GenerationStatus.ERROR,
-                                            isComplete = true,
-                                            error = "Error: ${e.message}"
-                                        )
-                                    }
-                                    _currentGenerationState.value = stateFlow.value
-
-                                    throw e
-                                }
-                                .collect()
-                        }
-                    } catch (e: CancellationException) {
-                        logger.info("Request collection was cancelled for generation $generationId")
-                        throw e
-                    }
-                }
-
-                logger.info("Template processing took $processingTime ms for generation $generationId")
-                logger.info("Request collection finished for generation $generationId")
-
-                if (isCancellationRequested.value) {
-                    throw CancellationException("Generation was cancelled after requests completed")
-                }
-
-                stateFlow.update { it.copy(status = GenerationStatus.PROCESSING_RESULTS) }
-                _currentGenerationState.value = stateFlow.value
-
-                val saveTime = measureTimeMillis {
-                    val result = resultRepository.processResults(
-                        generationId = generationId,
-                        templateId = template.id,
-                        templateName = template.name,
-                        placeholders = data,
-                        responses = stateFlow.value.responses,
-                        isComplete = true
-                    )
-
-                    resultRepository.saveResult(result)
-                }
-
-                logger.info("Result saving took $saveTime ms for generation $generationId")
-                logger.info("Generation $generationId completed successfully")
-
-                stateFlow.update {
-                    it.copy(
+                if (requests.isEmpty()) {
+                    logger.warn("No requests generated from template")
+                    val completedState = updatedState.copy(
                         status = GenerationStatus.COMPLETED,
+                        error = "No requests could be generated from template",
                         isComplete = true
                     )
+                    _currentGenerationState.value = completedState
+                    send(completedState)
+                    return@channelFlow
                 }
-                _currentGenerationState.value = stateFlow.value
+
+                logger.info("Proceeding with ${requests.size} generated requests")
+
+                val requestsState = updatedState.copy(
+                    status = GenerationStatus.SENDING_REQUESTS,
+                    totalCount = requests.size
+                )
+                _currentGenerationState.value = requestsState
+                send(requestsState)
+
+                logger.info("Calling requestRepository.sendRequests")
+                requestRepository.sendRequests(requests) { requestId, content, error ->
+                    logger.info("Progress update for request $requestId, error: $error")
+                }
+                    .collect { responses ->
+                        logger.info("Received response update with ${responses.size} responses")
+
+                        if (isCancellationRequested.value) {
+                            logger.info("Generation was cancelled, stopping flow")
+                            throw CancellationException("Generation was cancelled during processing")
+                        }
+
+                        val progressState = requestsState.copy(
+                            responses = responses,
+                            completedCount = responses.size
+                        )
+                        _currentGenerationState.value = progressState
+                        send(progressState)
+                    }
+
+                logger.info("All requests completed, finalizing generation")
+                val finalState = _currentGenerationState.value!!.copy(
+                    status = GenerationStatus.COMPLETED,
+                    isComplete = true
+                )
+                _currentGenerationState.value = finalState
+                send(finalState)
 
             } catch (e: CancellationException) {
-                logger.info("Generation cancelled: $generationId")
-
-                try {
-                    val partialResult = resultRepository.processResults(
-                        generationId = generationId,
-                        templateId = template.id,
-                        templateName = template.name,
-                        placeholders = data,
-                        responses = stateFlow.value.responses,
-                        isComplete = false
-                    )
-
-                    resultRepository.saveResult(partialResult)
-                } catch (ex: Exception) {
-                    logger.error("Error saving partial results during cancellation: $generationId", ex)
-                }
-
-                stateFlow.update {
-                    it.copy(
-                        status = GenerationStatus.CANCELLED,
-                        isComplete = true,
-                        error = "Generation cancelled"
-                    )
-                }
-
-                _currentGenerationState.value = stateFlow.value
-
+                logger.info("Generation process was cancelled")
+                val cancelledState = _currentGenerationState.value!!.copy(
+                    status = GenerationStatus.CANCELLED,
+                    isComplete = true,
+                    error = "Generation cancelled"
+                )
+                _currentGenerationState.value = cancelledState
+                send(cancelledState)
                 throw e
             } catch (e: Exception) {
-                logger.error("Error during generation: $generationId", e)
-
-                if (stateFlow.value.responses.isNotEmpty()) {
-                    try {
-                        val partialResult = resultRepository.processResults(
-                            generationId = generationId,
-                            templateId = template.id,
-                            templateName = template.name,
-                            placeholders = data,
-                            responses = stateFlow.value.responses,
-                            isComplete = false
-                        )
-
-                        resultRepository.saveResult(partialResult)
-                    } catch (ex: Exception) {
-                        logger.error("Error saving partial results after error: $generationId", ex)
-                    }
-                }
-
-                stateFlow.update {
-                    it.copy(
-                        status = GenerationStatus.ERROR,
-                        isComplete = true,
-                        error = "Error: ${e.message}"
-                    )
-                }
-
-                _currentGenerationState.value = stateFlow.value
-            } finally {
-                activeGenerationJobs.remove(generationId)
-                isCancellationRequested.value = false
+                logger.error("Error during generation process", e)
+                val errorState = _currentGenerationState.value!!.copy(
+                    status = GenerationStatus.ERROR,
+                    isComplete = true,
+                    error = "Error: ${e.message}"
+                )
+                _currentGenerationState.value = errorState
+                send(errorState)
             }
         }
-
-        activeGenerationJobs[generationId] = job
-
-        return stateFlow
     }
 
-    suspend fun retryRequests(
+    fun retryRequests(
         template: Template,
         requests: List<Request>,
         existingResponses: Map<String, Response>

@@ -35,6 +35,7 @@ class RequestRepositoryImpl(
 ) : RequestRepository {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val isCancelled = atomic(false)
+    private val responsesMutex = Mutex()
     private val responsesFlow = MutableStateFlow<Map<String, Response>>(emptyMap())
     private val pendingRetries = ConcurrentHashMap<String, Request>()
     private val activeRequestIds = ConcurrentHashMap.newKeySet<String>()
@@ -53,7 +54,9 @@ class RequestRepositoryImpl(
         logger.info("Sending ${requests.size} requests")
         isCancelled.value = false
 
-        responsesFlow.value = emptyMap()
+        responsesMutex.withLock {
+            responsesFlow.value = emptyMap()
+        }
         send(responsesFlow.value)
 
         supervisorScope {
@@ -76,10 +79,12 @@ class RequestRepositoryImpl(
                                 logger.debug("Sending request: ${request.id}")
                                 val response = llmService.sendRequest(request)
 
-                                responsesFlow.update { current ->
-                                    val updated = current.toMutableMap()
-                                    updated[request.id] = response
-                                    updated
+                                responsesMutex.withLock {
+                                    responsesFlow.update { current ->
+                                        val updated = current.toMutableMap()
+                                        updated[request.id] = response
+                                        updated
+                                    }
                                 }
 
                                 if (response.error != null) {
@@ -88,14 +93,16 @@ class RequestRepositoryImpl(
 
                                 onProgress(request.id, response.content, response.error)
 
-                                if (currentCoroutineContext().isActive && !isCancelled.value) {
-                                    send(responsesFlow.value)
-                                }
+                                completedCountMutex.withLock {
+                                    if (currentCoroutineContext().isActive && !isCancelled.value) {
+                                        send(responsesFlow.value)
+                                    }
 
-                                val current = completedCount.incrementAndGet()
-                                if (current >= totalCount) {
-                                    logger.info("All requests completed")
-                                    send(responsesFlow.value)
+                                    val current = completedCount.incrementAndGet()
+                                    if (current >= totalCount) {
+                                        logger.info("All requests completed")
+                                        send(responsesFlow.value)
+                                    }
                                 }
                             } catch (e: CancellationException) {
                                 throw e
@@ -112,23 +119,27 @@ class RequestRepositoryImpl(
                                     error = "Error: ${e.message}"
                                 )
 
-                                responsesFlow.update { current ->
-                                    val updated = current.toMutableMap()
-                                    updated[request.id] = errorResponse
-                                    updated
+                                responsesMutex.withLock {
+                                    responsesFlow.update { current ->
+                                        val updated = current.toMutableMap()
+                                        updated[request.id] = errorResponse
+                                        updated
+                                    }
                                 }
 
                                 pendingRetries[request.id] = request
                                 onProgress(request.id, "", e.message)
 
-                                if (currentCoroutineContext().isActive && !isCancelled.value) {
-                                    send(responsesFlow.value)
-                                }
+                                completedCountMutex.withLock {
+                                    if (currentCoroutineContext().isActive && !isCancelled.value) {
+                                        send(responsesFlow.value)
+                                    }
 
-                                val current = completedCount.incrementAndGet()
-                                if (current >= totalCount) {
-                                    logger.info("All requests completed (with errors)")
-                                    send(responsesFlow.value)
+                                    val current = completedCount.incrementAndGet()
+                                    if (current >= totalCount) {
+                                        logger.info("All requests completed (with errors)")
+                                        send(responsesFlow.value)
+                                    }
                                 }
                             } finally {
                                 activeRequestIds.remove(request.id)
@@ -145,23 +156,25 @@ class RequestRepositoryImpl(
             } catch (e: Exception) {
                 logger.error("Error sending requests", e)
 
-                requests
-                    .filter { !responsesFlow.value.containsKey(it.id) }
-                    .forEach { request ->
-                        val errorResponse = Response(
-                            id = request.id,
-                            content = "",
-                            error = "Error: ${e.message}"
-                        )
+                responsesMutex.withLock {
+                    requests
+                        .filter { !responsesFlow.value.containsKey(it.id) }
+                        .forEach { request ->
+                            val errorResponse = Response(
+                                id = request.id,
+                                content = "",
+                                error = "Error: ${e.message}"
+                            )
 
-                        responsesFlow.update { current ->
-                            val updated = current.toMutableMap()
-                            updated[request.id] = errorResponse
-                            updated
+                            responsesFlow.update { current ->
+                                val updated = current.toMutableMap()
+                                updated[request.id] = errorResponse
+                                updated
+                            }
+
+                            pendingRetries[request.id] = request
                         }
-
-                        pendingRetries[request.id] = request
-                    }
+                }
 
                 send(responsesFlow.value)
             }
@@ -225,6 +238,11 @@ class RequestRepositoryImpl(
 
         isCancelled.value = false
         val responses = MutableStateFlow(existingResponses)
+
+        responsesMutex.withLock {
+            responsesFlow.value = existingResponses
+        }
+
         send(responses.value)
 
         supervisorScope {
@@ -251,24 +269,34 @@ class RequestRepositoryImpl(
                                 logger.debug("Retrying request: ${request.id}")
                                 val response = llmService.sendRequest(request)
 
-                                responses.update { current ->
-                                    val updated = current.toMutableMap()
-                                    updated[request.id] = response
-                                    updated
+                                responsesMutex.withLock {
+                                    responses.update { current ->
+                                        val updated = current.toMutableMap()
+                                        updated[request.id] = response
+                                        updated
+                                    }
+
+                                    responsesFlow.update { current ->
+                                        val updated = current.toMutableMap()
+                                        updated[request.id] = response
+                                        updated
+                                    }
                                 }
 
                                 if (response.error == null) {
                                     pendingRetries.remove(request.id)
                                 }
 
-                                if (currentCoroutineContext().isActive && !isCancelled.value) {
-                                    send(responses.value)
-                                }
+                                completedCountMutex.withLock {
+                                    if (currentCoroutineContext().isActive && !isCancelled.value) {
+                                        send(responses.value)
+                                    }
 
-                                val current = completedCount.incrementAndGet()
-                                if (current >= totalCount) {
-                                    logger.info("All retry requests completed")
-                                    send(responses.value)
+                                    val current = completedCount.incrementAndGet()
+                                    if (current >= totalCount) {
+                                        logger.info("All retry requests completed")
+                                        send(responses.value)
+                                    }
                                 }
                             } catch (e: CancellationException) {
                                 throw e
@@ -285,20 +313,30 @@ class RequestRepositoryImpl(
                                     error = "Error during retry: ${e.message}"
                                 )
 
-                                responses.update { current ->
-                                    val updated = current.toMutableMap()
-                                    updated[request.id] = errorResponse
-                                    updated
+                                responsesMutex.withLock {
+                                    responses.update { current ->
+                                        val updated = current.toMutableMap()
+                                        updated[request.id] = errorResponse
+                                        updated
+                                    }
+
+                                    responsesFlow.update { current ->
+                                        val updated = current.toMutableMap()
+                                        updated[request.id] = errorResponse
+                                        updated
+                                    }
                                 }
 
-                                if (currentCoroutineContext().isActive && !isCancelled.value) {
-                                    send(responses.value)
-                                }
+                                completedCountMutex.withLock {
+                                    if (currentCoroutineContext().isActive && !isCancelled.value) {
+                                        send(responses.value)
+                                    }
 
-                                val current = completedCount.incrementAndGet()
-                                if (current >= totalCount) {
-                                    logger.info("All retry requests completed (with errors)")
-                                    send(responses.value)
+                                    val current = completedCount.incrementAndGet()
+                                    if (current >= totalCount) {
+                                        logger.info("All retry requests completed (with errors)")
+                                        send(responses.value)
+                                    }
                                 }
                             } finally {
                                 activeRequestIds.remove(request.id)
