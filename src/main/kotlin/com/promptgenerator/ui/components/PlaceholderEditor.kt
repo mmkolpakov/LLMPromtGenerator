@@ -35,6 +35,9 @@ fun PlaceholderEditor(
     var editorState by remember { mutableStateOf(PlaceholderEditorState()) }
     var debouncedValues by remember { mutableStateOf(placeholders) }
 
+    val emptyPlaceholders = placeholders.count { (_, value) -> value.isBlank() }
+    val totalPlaceholders = placeholders.size
+
     Card(
         modifier = modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
@@ -65,28 +68,28 @@ fun PlaceholderEditor(
                                     "How Variables Work:",
                                     style = MaterialTheme.typography.titleSmall,
                                     fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                                 Spacer(Modifier.height(4.dp))
                                 Text(
                                     "• Use {{variable_name}} in your template text",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                                 Text(
                                     "• For multiple values, separate with commas",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                                 Text(
                                     "• Example: colors = red, blue, green will generate 3 variants",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                                 Text(
                                     "• Empty variables will be replaced with blank values",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
                                     fontWeight = FontWeight.Bold
                                 )
                             }
@@ -141,6 +144,45 @@ fun PlaceholderEditor(
                     }
                 }
             } else {
+                // Status message about empty placeholders (informational, not blocking)
+                if (emptyPlaceholders > 0) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                        )
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Icon(
+                                imageVector = AppIcons.Info,
+                                contentDescription = "Information",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+
+                            Column {
+                                Text(
+                                    text = "Variables without values will be replaced with blank text",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+
+                                Text(
+                                    text = "$emptyPlaceholders of $totalPlaceholders variables are empty",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                }
+
                 Text(
                     text = "Add values for each variable (separate multiple values with commas):",
                     style = MaterialTheme.typography.bodyMedium,
@@ -148,17 +190,6 @@ fun PlaceholderEditor(
                 )
 
                 Spacer(Modifier.height(8.dp))
-
-                if (placeholders.any { (_, value) -> value.isBlank() }) {
-                    Text(
-                        text = "Note: Empty variables will be replaced with blank values in the output",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontStyle = FontStyle.Italic
-                    )
-
-                    Spacer(Modifier.height(4.dp))
-                }
 
                 Column(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -266,7 +297,7 @@ private fun PlaceholderItem(
 
     val isEmptyValue = localValue.isBlank()
     val containerColor = if (isEmptyValue) {
-        MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.2f)
+        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
     } else {
         MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
     }
@@ -311,9 +342,9 @@ private fun PlaceholderItem(
                             }
                         ) {
                             Icon(
-                                imageVector = AppIcons.Warning,
+                                imageVector = AppIcons.Info,
                                 contentDescription = "Empty Variable",
-                                tint = MaterialTheme.colorScheme.error,
+                                tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
                                 modifier = Modifier.padding(end = 8.dp)
                             )
                         }
@@ -349,14 +380,7 @@ private fun PlaceholderItem(
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("Values (comma-separated)") },
                 placeholder = { Text("e.g. value1, value2, value3") },
-                colors = if (isEmptyValue) {
-                    OutlinedTextFieldDefaults.colors(
-                        unfocusedBorderColor = MaterialTheme.colorScheme.error.copy(alpha = 0.5f),
-                        unfocusedLabelColor = MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
-                    )
-                } else {
-                    OutlinedTextFieldDefaults.colors()
-                }
+                colors = OutlinedTextFieldDefaults.colors()
             )
 
             AnimatedVisibility(visible = localValue.contains(",")) {
@@ -373,7 +397,7 @@ private fun PlaceholderItem(
                     text = "Empty variable will be replaced with a blank value",
                     style = MaterialTheme.typography.bodySmall,
                     fontStyle = FontStyle.Italic,
-                    color = MaterialTheme.colorScheme.error
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }

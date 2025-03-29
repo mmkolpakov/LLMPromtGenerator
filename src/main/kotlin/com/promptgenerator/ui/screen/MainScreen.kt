@@ -157,7 +157,7 @@ fun MainScreen(
                             tooltip = {
                                 Text(
                                     text = if (uiState.isDarkTheme) "Switch to light theme" else "Switch to dark theme",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                             }
                         ) {

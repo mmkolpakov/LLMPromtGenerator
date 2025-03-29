@@ -332,7 +332,8 @@ fun SettingsScreen(
 
                                 CustomTooltip(
                                     tooltip = {
-                                        Text("Edit provider settings")
+                                        Text("Edit provider settings",
+                                            color = MaterialTheme.colorScheme.onSecondaryContainer)
                                     }
                                 ) {
                                     OutlinedButton(

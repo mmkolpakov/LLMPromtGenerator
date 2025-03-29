@@ -189,7 +189,7 @@ fun ResultsView(
                                 tooltip = {
                                     Text(
                                         text = "Save all results as text files to: $exportPath",
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer
                                     )
                                 }
                             ) {
@@ -214,7 +214,7 @@ fun ResultsView(
                                 tooltip = {
                                     Text(
                                         text = "Clear all generated results",
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer
                                     )
                                 }
                             ) {
@@ -494,7 +494,7 @@ private fun ResultCard(
                             tooltip = {
                                 Text(
                                     text = "Retry this request",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                             }
                         ) {
@@ -511,7 +511,7 @@ private fun ResultCard(
                             tooltip = {
                                 Text(
                                     text = if (isCopied) "Copied to clipboard!" else "Copy to clipboard",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                             }
                         ) {
@@ -535,7 +535,7 @@ private fun ResultCard(
                         tooltip = {
                             Text(
                                 text = if (isExpanded) "Collapse" else "Show full content",
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
                             )
                         }
                     ) {

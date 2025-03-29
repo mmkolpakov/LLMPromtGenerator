@@ -36,7 +36,7 @@ fun CustomTooltip(
                 modifier = Modifier,
                 shape = MaterialTheme.shapes.medium,
                 colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.inverseSurface
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer
                 ),
                 elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
             ) {

@@ -64,11 +64,8 @@ fun HistoryScreen(
     val uiState = viewModel.uiState
     val snackbarHostState = remember { SnackbarHostState() }
     val lazyListState = rememberLazyListState()
-
-    // Pagination state
     var currentPage by remember { mutableStateOf(0) }
 
-    // Calculate pagination
     val paginatedResults by remember(uiState.results, currentPage) {
         derivedStateOf {
             uiState.results
@@ -79,17 +76,14 @@ fun HistoryScreen(
 
     val totalPages = (uiState.results.size + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE
 
-    // Reset to first page when results change significantly
     LaunchedEffect(uiState.results.size) {
         currentPage = 0
     }
 
-    // Scroll to top when page changes
     LaunchedEffect(currentPage) {
         lazyListState.scrollToItem(0)
     }
 
-    // Show error or success message
     LaunchedEffect(uiState.errorMessage, uiState.successMessage) {
         uiState.errorMessage?.let {
             snackbarHostState.showSnackbar(it)
@@ -191,7 +185,6 @@ fun HistoryScreen(
             }
         }
 
-        // Snackbar for messages
         SnackbarHost(
             hostState = snackbarHostState,
             modifier = Modifier
@@ -200,7 +193,6 @@ fun HistoryScreen(
         )
     }
 
-    // Details dialog
     if (uiState.showDetailsDialog) {
         ResultDetailsDialog(
             result = uiState.currentResult,
@@ -315,7 +307,9 @@ private fun HistoryItem(
                 if (!result.isComplete) {
                     CustomTooltip(
                         tooltip = {
-                            Text("This generation was cancelled or encountered an error")
+                            Text("This generation was cancelled or encountered an error",
+                                color = MaterialTheme.colorScheme.error
+                            )
                         }
                     ) {
                         Icon(

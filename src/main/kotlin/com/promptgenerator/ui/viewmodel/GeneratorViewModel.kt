@@ -75,6 +75,14 @@ class GeneratorViewModel(
         }
     }
 
+    private fun validatePlaceholderData(placeholders: Set<String>, data: Map<String, String>): Boolean {
+        val emptyPlaceholders = placeholders.filter { placeholder ->
+            data[placeholder]?.isBlank() != false
+        }
+
+        return emptyPlaceholders.isEmpty()
+    }
+
     private fun startStateUpdateJob() {
         stateUpdateJob?.cancel()
         stateUpdateJob = viewModelScope.launch {
@@ -262,7 +270,6 @@ class GeneratorViewModel(
         }
 
         logger.info("Generate button clicked, starting generation process")
-
         logger.info("Current template content: '${uiState.templateContent}'")
         logger.info("Placeholder data: ${uiState.placeholderData}")
 
@@ -287,21 +294,19 @@ class GeneratorViewModel(
                         return@withLock
                     }
 
-                    updateUiState { currentState ->
-                        currentState.copy(
-                            errorMessage = null,
-                            networkError = null,
-                            results = emptyMap(),
-                            partialResponses = emptyMap()
-                        )
-                    }
-
                     val placeholderData = prepareDataForGeneration(uiState.placeholderData)
                     logger.info("Placeholder data prepared: ${placeholderData.keys}")
 
-                    if (placeholderData.isEmpty() && placeholders.isNotEmpty()) {
-                        logger.warn("No values provided for any placeholders, will proceed with empty values")
+                    val allPlaceholders = promptGeneratorService.extractPlaceholders(uiState.templateContent)
+                        .associateWith { "" as Any }
+                        .toMutableMap()
+
+                    val userPlaceholderData = prepareDataForGeneration(uiState.placeholderData)
+                    userPlaceholderData.forEach { (key, value) ->
+                        allPlaceholders[key] = value
                     }
+
+                    logger.info("Complete placeholder data map: $allPlaceholders")
 
                     val template = Template(
                         id = uiState.templateId.ifBlank { UUID.randomUUID().toString() },
@@ -309,21 +314,22 @@ class GeneratorViewModel(
                         content = uiState.templateContent
                     )
 
-                    logger.info("Starting generation with template: '${template.name}', placeholder count: ${placeholderData.size}")
+                    logger.info("Starting generation with template: '${template.name}', placeholder count: ${allPlaceholders.size}")
 
                     failedRequests.clear()
 
-                    updateUiState { currentState ->
-                        currentState.copy(
-                            isGenerating = true,
-                            generationId = "",
-                            errorMessage = null,
-                            generationStatus = GenerationStatus.PREPARING,
-                            generationProgress = 0f,
-                            completedCount = 0,
-                            totalCount = 0
-                        )
-                    }
+//                    TODO - из-за него зависает на PREPARING, гад
+//                    updateUiState { currentState ->
+//                        currentState.copy(
+//                            isGenerating = true,
+//                            generationId = "",
+//                            errorMessage = null,
+//                            generationStatus = GenerationStatus.PREPARING,
+//                            generationProgress = 0f,
+//                            completedCount = 0,
+//                            totalCount = 0
+//                        )
+//                    }
 
                     isUpdating.value = false
 
@@ -335,7 +341,7 @@ class GeneratorViewModel(
                                 logger.info("Calling promptGeneratorService.generate()")
                                 promptGeneratorService.generate(
                                     template = template,
-                                    data = placeholderData,
+                                    data = allPlaceholders,
                                     maxCombinations = uiState.maxCombinations,
                                     systemPrompt = uiState.systemPrompt
                                 )
@@ -346,7 +352,7 @@ class GeneratorViewModel(
                                         }
                                     }
                                     .collect { state ->
-                                        logger.info("Generation state update: status=${state.status}, complete=${state.isComplete}")
+                                        logger.info("Generation state update: status=${state.status}, complete=${state.isComplete}, responses=${state.responses.size}")
                                         analyzeErrorsInResponses(state)
                                     }
                             } catch (e: CancellationException) {
@@ -436,57 +442,29 @@ class GeneratorViewModel(
     }
 
     private fun prepareDataForGeneration(placeholderData: Map<String, String>): Map<String, Any> {
-        return placeholderData.filterValues { it.isNotBlank() }
-            .mapValues { (_, value) ->
-                when {
-                    value.trim().startsWith("[") && value.trim().endsWith("]") -> {
-                        val listContent = value.trim().removeSurrounding("[", "]")
-                        parseListValues(listContent)
+        try {
+            logger.info("Preparing data for generation, raw input: $placeholderData")
+            val result = placeholderData.mapValues { (key, value) ->
+                try {
+                    when {
+                        value.isBlank() -> ""
+                        value.contains(",") -> {
+                            val items = value.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                            if (items.isEmpty()) "" else items
+                        }
+                        else -> value
                     }
-                    value.contains(",") -> {
-                        parseListValues(value)
-                    }
-                    else -> {
-                        value
-                    }
+                } catch (e: Exception) {
+                    logger.error("Error processing placeholder $key with value '$value'", e)
+                    value
                 }
             }
-    }
 
-    private fun parseListValues(input: String): List<String> {
-        if (input.isBlank()) return emptyList()
-
-        val result = mutableListOf<String>()
-        var current = StringBuilder()
-        var inQuotes = false
-        var escaped = false
-
-        for (char in input) {
-            when {
-                escaped -> {
-                    current.append(char)
-                    escaped = false
-                }
-                char == '\\' -> escaped = true
-                char == '"' -> inQuotes = !inQuotes
-                char == ',' && !inQuotes -> {
-                    result.add(current.toString().trim())
-                    current = StringBuilder()
-                }
-                else -> current.append(char)
-            }
-        }
-
-        if (current.isNotEmpty()) {
-            result.add(current.toString().trim())
-        }
-
-        return result.map { value ->
-            if (value.startsWith("\"") && value.endsWith("\"") && value.length >= 2) {
-                value.substring(1, value.length - 1)
-            } else {
-                value
-            }
+            logger.info("Data preparation complete: $result")
+            return result
+        } catch (e: Exception) {
+            logger.error("Error in prepareDataForGeneration", e)
+            return placeholderData.mapValues { it.value }
         }
     }
 
@@ -602,12 +580,6 @@ class GeneratorViewModel(
 
                 newPlaceholders.forEach { placeholder ->
                     placeholderData[placeholder] = uiState.placeholderData[placeholder] ?: ""
-                }
-
-                if (placeholderData.isEmpty() && newPlaceholders.isNotEmpty()) {
-                    newPlaceholders.forEach { placeholder ->
-                        placeholderData[placeholder] = ""
-                    }
                 }
 
                 updateUiState { currentState ->
@@ -841,25 +813,6 @@ class GeneratorViewModel(
                 ))
             } catch (e: Exception) {
                 logger.error("Error updating showPartialResults setting", e)
-            }
-        }
-    }
-
-    fun updateMaxCombinations(maxCombinations: Int) {
-        viewModelScope.launch {
-            updateUiState { currentState ->
-                currentState.copy(
-                    maxCombinations = maxCombinations
-                )
-            }
-
-            try {
-                val settings = settingsManager.getSettings()
-                settingsManager.updateSettings(settings.copy(
-                    maxCombinations = maxCombinations
-                ))
-            } catch (e: Exception) {
-                logger.error("Error updating maxCombinations setting", e)
             }
         }
     }

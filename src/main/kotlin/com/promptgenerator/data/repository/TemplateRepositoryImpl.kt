@@ -83,11 +83,21 @@ class TemplateRepositoryImpl(
         maxCombinations: Int,
         systemInstruction: String?
     ): List<Request> {
-        if (placeholderValues.isEmpty()) {
-            return listOf(Request(UUID.randomUUID().toString(), template.content, systemInstruction))
+
+        val nonEmptyPlaceholders = placeholderValues.filter { (_, values) ->
+            values.isNotEmpty() && !(values.size == 1 && values[0].toString().isBlank())
         }
 
-        val placeholderKeys = placeholderValues.keys.toList()
+        if (nonEmptyPlaceholders.isEmpty()) {
+            var content = template.content
+            placeholderValues.forEach { (placeholder, _) ->
+                content = content.replace("{{$placeholder}}", "")
+            }
+            return listOf(Request(UUID.randomUUID().toString(), content, systemInstruction))
+        }
+
+        val placeholderKeys = nonEmptyPlaceholders.keys.toList()
+
         val maxSizes = placeholderKeys.map { placeholderValues[it]?.size ?: 1 }
 
         var totalCombinations = 1L

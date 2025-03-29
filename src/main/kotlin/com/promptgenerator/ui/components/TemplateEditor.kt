@@ -131,23 +131,23 @@ fun TemplateEditor(
                                     "How Templates Work:",
                                     style = MaterialTheme.typography.titleSmall,
                                     fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                                 Spacer(Modifier.height(4.dp))
                                 Text(
                                     "• Use {{variable_name}} for dynamic content",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                                 Text(
                                     "• Variables will be replaced with values you provide",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                                 Text(
                                     "• Click 'See Examples' for template ideas",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.inversePrimary
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
                                 )
                             }
                         }

@@ -19,6 +19,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -27,7 +28,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -114,7 +114,10 @@ fun GeneratorScreen(
 
                             CustomTooltip(
                                 tooltip = {
-                                    Text("Set instructions for how the LLM should respond")
+                                    Text(
+                                        "Set instructions for how the LLM should respond",
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                                    )
                                 }
                             ) {
                                 TextButton(onClick = {
@@ -187,7 +190,7 @@ fun GeneratorScreen(
                     if (uiState.templateValidation.placeholders.isNotEmpty() &&
                         uiState.templateValidation.placeholders.size > uiState.placeholderData.count { (_, value) -> value.isNotBlank() }) {
                         Text(
-                            text = "Note: Some placeholders are empty and will be replaced with blank values",
+                            text = "Note: Empty placeholders will be replaced with blank values",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(top = 4.dp)
