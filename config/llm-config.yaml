@@ -26,7 +26,7 @@ providers:
       retryDelay: 1000
   "gemini":
     baseUrl: "https://generativelanguage.googleapis.com"
-    apiKey: "AIzaSyDJNtgyyhBDqfHvA82F7t2mCVubeqVkBHA"
+    apiKey: "YOUR_API_KEY"
     port: 0
     protocol: "https"
     defaultModel: "gemini-1.5-flash"
