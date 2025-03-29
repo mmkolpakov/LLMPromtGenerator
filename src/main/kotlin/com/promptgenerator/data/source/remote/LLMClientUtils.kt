@@ -1,5 +1,6 @@
 package com.promptgenerator.data.source.remote
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import org.slf4j.LoggerFactory
 import kotlinx.atomicfu.atomic
@@ -19,8 +20,9 @@ class LLMClientUtils {
         requestId: String,
         maxRetries: Int = 3,
         initialDelay: Long = 1000,
-        maxDelay: Long = 10000,
+        maxDelay: Long = 30000,
         factor: Double = 2.0,
+        retryOnPredicate: (Throwable) -> Boolean = { isRetryableError(it) },
         block: suspend () -> T
     ): T {
         var currentDelay = initialDelay
@@ -29,48 +31,47 @@ class LLMClientUtils {
         while (true) {
             try {
                 return block()
+            } catch (e: CancellationException) {
+                logger.info("Operation cancelled for request: $requestId")
+                throw e
             } catch (e: Exception) {
                 attempt++
 
                 if (isCancelled.value) {
-                    logger.info("Operation cancelled for request: $requestId")
+                    logger.info("Operation cancelled during retry for request: $requestId")
+                    throw CancellationException("Operation cancelled", e)
+                }
+
+                if (attempt >= maxRetries || !retryOnPredicate(e)) {
+                    logger.error("Max retries reached or non-retriable error for request: $requestId", e)
                     throw e
                 }
 
-                if (attempt >= maxRetries) {
-                    logger.error("Max retries reached for request: $requestId", e)
-                    throw e
-                }
+                logger.warn("Retry attempt $attempt/$maxRetries for request $requestId, backing off for $currentDelay ms. Error: ${e.message}")
 
-                if (isRateLimitError(e)) {
-                    logger.warn("Rate limit hit for request $requestId (attempt $attempt/$maxRetries), backing off for $currentDelay ms")
+                val jitter = (Random.nextDouble() * 0.2 * currentDelay).toLong()
+                val delayWithJitter = currentDelay + jitter
 
-                    val jitter = Random.nextLong(currentDelay / 4)
-                    val delayWithJitter = currentDelay + jitter
+                val delayChunks = 100L.milliseconds
+                var remainingDelay = delayWithJitter
 
-                    val delayChunks = 100L.milliseconds
-                    var remainingDelay = delayWithJitter
-
-                    while (remainingDelay > 0) {
-                        if (isCancelled.value) {
-                            logger.info("Retry wait cancelled for request: $requestId")
-                            throw e
-                        }
-
-                        val delayAmount = min(delayChunks.inWholeMilliseconds, remainingDelay)
-                        delay(delayAmount)
-                        remainingDelay -= delayAmount
+                while (remainingDelay > 0) {
+                    if (isCancelled.value) {
+                        logger.info("Retry wait cancelled for request: $requestId")
+                        throw CancellationException("Operation cancelled during retry wait", e)
                     }
 
-                    currentDelay = min((currentDelay * factor).toLong(), maxDelay)
-                } else {
-                    throw e
+                    val delayAmount = min(delayChunks.inWholeMilliseconds, remainingDelay)
+                    delay(delayAmount)
+                    remainingDelay -= delayAmount
                 }
+
+                currentDelay = min((currentDelay * factor).toLong(), maxDelay)
             }
         }
     }
 
-    private fun isRateLimitError(e: Exception): Boolean {
+    private fun isRetryableError(e: Throwable): Boolean {
         val message = e.message?.lowercase() ?: ""
         return message.contains("429") ||
                 message.contains("rate limit") ||
@@ -78,7 +79,13 @@ class LLMClientUtils {
                 message.contains("too many requests") ||
                 message.contains("capacity") ||
                 message.contains("overloaded") ||
-                message.contains("throttl")
+                message.contains("throttl") ||
+                message.contains("timeout") ||
+                message.contains("timed out") ||
+                message.contains("connection reset") ||
+                message.contains("connection closed") ||
+                message.contains("unavailable") ||
+                message.contains("try again")
     }
 
     fun logRequestStart(provider: String, requestId: String, model: String) {
@@ -89,7 +96,7 @@ class LLMClientUtils {
         logger.info("Successfully received response from $provider for request $requestId")
     }
 
-    fun logRequestError(provider: String, requestId: String, error: Exception, isRetry: Boolean = false) {
+    fun logRequestError(provider: String, requestId: String, error: Throwable, isRetry: Boolean = false) {
         val retryMsg = if (isRetry) " during retry" else ""
         logger.error("Error from $provider for request $requestId$retryMsg: ${error.message}", error)
     }

@@ -24,7 +24,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,6 +40,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.promptgenerator.ui.icons.AppIcons
+import kotlinx.coroutines.delay
 
 data class PlaceholderEditorState(
     val showAddDialog: Boolean = false,
@@ -56,6 +59,7 @@ fun PlaceholderEditor(
     modifier: Modifier = Modifier
 ) {
     var editorState by remember { mutableStateOf(PlaceholderEditorState()) }
+    var debouncedValues by remember { mutableStateOf(placeholders) }
 
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -108,7 +112,7 @@ fun PlaceholderEditor(
                             }
                         }
                     ) {
-                        IconButton(onClick = { /* Tooltip handled by CustomTooltip */ }) {
+                        IconButton(onClick = { }) {
                             Icon(
                                 imageVector = AppIcons.InfoOutlined,
                                 contentDescription = "Help",
@@ -172,10 +176,27 @@ fun PlaceholderEditor(
                         PlaceholderItem(
                             name = name,
                             value = value,
-                            onValueChange = { onPlaceholderChange(name, it) },
+                            onValueChange = { newValue ->
+                                val key = name
+                                debouncedValues = debouncedValues.toMutableMap().apply {
+                                    this[key] = newValue
+                                }
+                            },
                             onEdit = { editorState = editorState.copy(selectedPlaceholder = name) },
                             onRemove = { onRemovePlaceholder(name) }
                         )
+                    }
+                }
+
+                // Update UI with debounced value changes
+                LaunchedEffect(debouncedValues) {
+                    if (debouncedValues != placeholders) {
+                        delay(300)
+                        debouncedValues.forEach { (key, value) ->
+                            if (placeholders[key] != value) {
+                                onPlaceholderChange(key, value)
+                            }
+                        }
                     }
                 }
             }
@@ -245,6 +266,14 @@ private fun PlaceholderItem(
         append("}}")
     }
 
+    var localValue by remember { mutableStateOf(value) }
+
+    LaunchedEffect(value) {
+        if (value != localValue) {
+            localValue = value
+        }
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -297,14 +326,17 @@ private fun PlaceholderItem(
             }
 
             OutlinedTextField(
-                value = value,
-                onValueChange = onValueChange,
+                value = localValue,
+                onValueChange = {
+                    localValue = it
+                    onValueChange(it)
+                },
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("Values (comma-separated)") },
                 placeholder = { Text("e.g. value1, value2, value3") }
             )
 
-            AnimatedVisibility(visible = value.contains(",")) {
+            AnimatedVisibility(visible = localValue.contains(",")) {
                 Text(
                     text = "Multiple values detected - this will generate multiple prompts",
                     style = MaterialTheme.typography.bodySmall,

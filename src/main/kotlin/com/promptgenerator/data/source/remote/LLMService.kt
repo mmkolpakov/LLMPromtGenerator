@@ -278,32 +278,21 @@ class LLMService(
                 if (waitTime > 0) {
                     logger.info("Rate limit reached. Waiting for $waitTime ms before next request")
 
-                    rateLimitingMutex.unlock()
-                    try {
-                        val checkInterval = 100L.milliseconds
-                        var remainingWait = waitTime
+                    var remainingWait = waitTime
+                    val checkInterval = 100L
 
-                        while (remainingWait > 0) {
-                            if (isCancelled.value) {
-                                throw CancellationException("Request cancelled during rate limiting wait")
-                            }
+                    while (remainingWait > 0 && !isCancelled.value) {
+                        val delayAmount = minOf(checkInterval, remainingWait)
+                        delay(delayAmount)
+                        remainingWait -= delayAmount
 
-                            val delayAmount = minOf(checkInterval.inWholeMilliseconds, remainingWait)
-                            delay(delayAmount)
-                            remainingWait -= delayAmount
+                        if (isCancelled.value) {
+                            throw CancellationException("Request cancelled during rate limiting wait")
                         }
-                    } finally {
-                        rateLimitingMutex.lock()
-                    }
-
-                    if (isCancelled.value) {
-                        throw CancellationException("Request cancelled during rate limiting wait")
                     }
                 }
 
-                val newCurrentTime = System.currentTimeMillis()
-                val newOneMinuteAgo = newCurrentTime - TimeUnit.MINUTES.toMillis(1)
-                requestTimestamps.removeAll { it < newOneMinuteAgo }
+                requestTimestamps.removeAll { it < currentTime - TimeUnit.MINUTES.toMillis(1) }
             }
 
             requestTimestamps.add(System.currentTimeMillis())

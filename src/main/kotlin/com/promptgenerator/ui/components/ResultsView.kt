@@ -106,14 +106,16 @@ fun ResultsView(
 
     val totalPages = (displayResults.size + RESULTS_PER_PAGE - 1) / RESULTS_PER_PAGE
 
-    LaunchedEffect(results.isNotEmpty()) {
-        currentPage = 0
-        expandedItems.clear()
-        copiedItems.clear()
+    LaunchedEffect(displayResults.isNotEmpty()) {
+        if (currentPage >= totalPages && totalPages > 0) {
+            currentPage = totalPages - 1
+        }
     }
 
     LaunchedEffect(currentPage) {
-        lazyListState.scrollToItem(0)
+        if (lazyListState.firstVisibleItemIndex > 0) {
+            lazyListState.scrollToItem(0)
+        }
     }
 
     AnimatedVisibility(

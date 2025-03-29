@@ -33,7 +33,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.1")
 
     // Compose adaptive layouts
-    implementation("androidx.compose.material3.adaptive:adaptive:1.2.0-alpha01")
+//    implementation("androidx.compose.material3.adaptive:adaptive:1.2.0-alpha01")
 
     // Ktor client for HTTP requests - unified version
     implementation("io.ktor:ktor-client-core:3.1.1")

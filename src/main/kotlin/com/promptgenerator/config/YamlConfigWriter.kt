@@ -35,7 +35,13 @@ object YamlConfigWriter {
                 throw IOException("Failed to write configuration (empty file)")
             }
 
-            Files.move(tempFile, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            try {
+                Files.move(tempFile, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            } catch (e: UnsupportedOperationException) {
+                logger.warn("Atomic move not supported, falling back to copy and delete")
+                Files.copy(tempFile, path, StandardCopyOption.REPLACE_EXISTING)
+                Files.delete(tempFile)
+            }
 
             logger.info("LLM configuration written to $filePath")
             return true

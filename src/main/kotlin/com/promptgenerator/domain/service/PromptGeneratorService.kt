@@ -33,6 +33,7 @@ import org.slf4j.LoggerFactory
 import java.util.UUID
 import kotlinx.atomicfu.atomic
 import kotlinx.coroutines.cancel
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.system.measureTimeMillis
 
 class PromptGeneratorService(
@@ -46,7 +47,7 @@ class PromptGeneratorService(
     private val _currentGenerationState = MutableStateFlow<GenerationState?>(null)
     val currentGenerationState: StateFlow<GenerationState?> = _currentGenerationState.asStateFlow()
 
-    private val activeGenerationJobs = mutableMapOf<String, Job>()
+    private val activeGenerationJobs = ConcurrentHashMap<String, Job>()
     private val isCancellationRequested = atomic(false)
 
     fun validateTemplate(templateContent: String): ValidationResult {
@@ -136,16 +137,13 @@ class PromptGeneratorService(
                     }
                     _currentGenerationState.value = stateFlow.value
 
-                    val responses = mutableMapOf<String, Response>()
+                    val responses = ConcurrentHashMap<String, Response>()
 
                     try {
                         withTimeout(600_000) {
                             requestRepository.sendRequests(requests) { requestId, content, error ->
                                 val response = Response(requestId, content, error)
-
-                                synchronized(responses) {
-                                    responses[requestId] = response
-                                }
+                                responses[requestId] = response
 
                                 stateFlow.update {
                                     it.copy(
@@ -302,16 +300,12 @@ class PromptGeneratorService(
 
                 _currentGenerationState.value = stateFlow.value
             } finally {
-                synchronized(activeGenerationJobs) {
-                    activeGenerationJobs.remove(generationId)
-                }
+                activeGenerationJobs.remove(generationId)
                 isCancellationRequested.value = false
             }
         }
 
-        synchronized(activeGenerationJobs) {
-            activeGenerationJobs[generationId] = job
-        }
+        activeGenerationJobs[generationId] = job
 
         return stateFlow
     }
@@ -379,9 +373,7 @@ class PromptGeneratorService(
             }
         }
 
-        synchronized(activeGenerationJobs) {
-            activeGenerationJobs[generationId] = job
-        }
+        activeGenerationJobs[generationId] = job
     }
 
     suspend fun cancelGeneration() = withContext(Dispatchers.IO) {
@@ -392,11 +384,9 @@ class PromptGeneratorService(
 
             requestRepository.cancelRequests()
 
-            val jobsCopy = synchronized(activeGenerationJobs) {
-                activeGenerationJobs.values.toList()
+            for (job in activeGenerationJobs.values) {
+                job.cancel()
             }
-
-            jobsCopy.forEach { it.cancel() }
 
             _currentGenerationState.value?.let { currentState ->
                 if (!currentState.isComplete) {
@@ -421,18 +411,14 @@ class PromptGeneratorService(
     }
 
     fun close() {
-        val jobsCopy = synchronized(activeGenerationJobs) {
-            activeGenerationJobs.values.toList()
-        }
-
-        jobsCopy.forEach { it.cancel() }
-
-        synchronized(activeGenerationJobs) {
-            activeGenerationJobs.clear()
-        }
-
-        requestRepository.close()
         isCancellationRequested.value = false
+
+        for (job in activeGenerationJobs.values) {
+            job.cancel()
+        }
+
+        activeGenerationJobs.clear()
+        requestRepository.close()
         scope.cancel()
     }
 }

@@ -25,20 +25,20 @@ import kotlinx.coroutines.SupervisorJob
 val appModule = module {
     single { ConfigLoader.loadLLMConfig() }
     single { SettingsManager() }
-    factory { params ->
-        val settings = get<SettingsManager>()
-        val templatesPath = params.getOrNull<String>() ?: "templates"
-        TemplateLocalDataSource(templatesPath)
+
+    single {
+        val settings = get<SettingsManager>().getSettings()
+        TemplateLocalDataSource(settings.saveTemplatesPath)
     }
 
-    factory {
-        val settings = get<SettingsManager>()
-        ResultLocalDataSource(resultsDir = "results", maxCachedResults = 100)
+    single {
+        val settings = get<SettingsManager>().getSettings()
+        ResultLocalDataSource(resultsDir = "results", maxCachedResults = settings.resultsLimit)
     }
 
-    factory { LLMService(get()) }
+    single { LLMService(get()) }
 
-    single<TemplateRepository> { TemplateRepositoryImpl(get(parameters = { TODO() })) }
+    single<TemplateRepository> { TemplateRepositoryImpl(get()) }
     single<RequestRepository> { RequestRepositoryImpl(get()) }
     single<ResultRepository> { ResultRepositoryImpl(get(), get()) }
 

@@ -22,7 +22,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
@@ -36,6 +35,7 @@ import kotlinx.coroutines.sync.withLock
 import java.io.Closeable
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class GeneratorViewModel(
     private val promptGeneratorService: PromptGeneratorService,
@@ -46,9 +46,9 @@ class GeneratorViewModel(
     private val viewModelScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var generateJob: Job? = null
     private var stateUpdateJob: Job? = null
-    private val failedRequests = mutableMapOf<String, Request>()
-    private val failedRequestsMutex = Mutex()
+    private val failedRequests = ConcurrentHashMap<String, Request>()
     private val isUpdating = atomic(false)
+    private val stateMutex = Mutex()
 
     var uiState by mutableStateOf(GeneratorUiState())
         private set
@@ -249,9 +249,7 @@ class GeneratorViewModel(
         )
 
         viewModelScope.launch {
-            failedRequestsMutex.withLock {
-                failedRequests.clear()
-            }
+            failedRequests.clear()
 
             uiState = uiState.copy(
                 isGenerating = true,
@@ -266,7 +264,7 @@ class GeneratorViewModel(
             isUpdating.value = false
 
             try {
-                generateJob?.cancelAndJoin()
+                generateJob?.cancel()
                 generateJob = viewModelScope.launch {
                     try {
                         logger.info("Starting generation with system prompt: '${uiState.systemPrompt}'")
@@ -343,34 +341,16 @@ class GeneratorViewModel(
                 networkError = primaryError
             )
 
-            state.error?.let { error ->
-                val requests = promptGeneratorService.processTemplate(
-                    Template(
-                        id = UUID.randomUUID().toString(),
-                        name = "Error Template",
-                        content = error
-                    ),
-                    emptyMap()
-                )
-
-                failedRequestsMutex.withLock {
-                    requests.forEach { request ->
-                        failedRequests[request.id] = request
-                    }
-                }
-            }
-
-            failedRequestsMutex.withLock {
-                errorResponses.forEach { (id, response) ->
-                    state.responses.keys.find { it == id }?.let { responseId ->
-                        state.template.let { template ->
-                            val requestContent = if (response.content.isBlank()) response.error ?: "" else response.content
-                            failedRequests[responseId] = Request(
-                                id = responseId,
-                                content = requestContent,
-                                systemInstruction = uiState.systemPrompt
-                            )
-                        }
+            // Save all failed requests for retry
+            errorResponses.forEach { (id, response) ->
+                state.responses.keys.find { it == id }?.let { responseId ->
+                    state.template.let { template ->
+                        val requestContent = if (response.content.isBlank()) response.error ?: "" else response.content
+                        failedRequests[responseId] = Request(
+                            id = responseId,
+                            content = requestContent,
+                            systemInstruction = uiState.systemPrompt
+                        )
                     }
                 }
             }
@@ -436,39 +416,41 @@ class GeneratorViewModel(
         try {
             isUpdating.value = true
 
-            if (uiState.generationId.isEmpty() || state.id == uiState.generationId) {
-                val finalResponses = if (state.isComplete && state.status == GenerationStatus.COMPLETED) {
-                    state.responses
-                } else if (uiState.results.isNotEmpty()) {
-                    uiState.results
-                } else {
-                    emptyMap()
-                }
+            stateMutex.withLock {
+                if (uiState.generationId.isEmpty() || state.id == uiState.generationId) {
+                    val finalResponses = if (state.isComplete && state.status == GenerationStatus.COMPLETED) {
+                        state.responses
+                    } else if (uiState.results.isNotEmpty()) {
+                        uiState.results
+                    } else {
+                        emptyMap()
+                    }
 
-                val partialResponses = if (!state.isComplete || state.status == GenerationStatus.CANCELLED) {
-                    state.responses
-                } else {
-                    uiState.partialResponses
-                }
+                    val partialResponses = if (!state.isComplete || state.status == GenerationStatus.CANCELLED) {
+                        state.responses
+                    } else {
+                        uiState.partialResponses
+                    }
 
-                uiState = uiState.copy(
-                    generationId = state.id,
-                    isGenerating = !state.isComplete,
-                    generationStatus = state.status,
-                    generationProgress = state.progress,
-                    partialResponses = partialResponses,
-                    completedCount = state.completedCount,
-                    totalCount = state.totalCount,
-                    errorMessage = state.error
-                )
-
-                if (state.isComplete) {
                     uiState = uiState.copy(
-                        isGenerating = false,
-                        results = if (state.status == GenerationStatus.COMPLETED) state.responses else finalResponses
+                        generationId = state.id,
+                        isGenerating = !state.isComplete,
+                        generationStatus = state.status,
+                        generationProgress = state.progress,
+                        partialResponses = partialResponses,
+                        completedCount = state.completedCount,
+                        totalCount = state.totalCount,
+                        errorMessage = state.error
                     )
 
-                    logger.info("Generation complete with status: ${state.status}")
+                    if (state.isComplete) {
+                        uiState = uiState.copy(
+                            isGenerating = false,
+                            results = if (state.status == GenerationStatus.COMPLETED) state.responses else finalResponses
+                        )
+
+                        logger.info("Generation complete with status: ${state.status}")
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -633,11 +615,7 @@ class GeneratorViewModel(
             successMessage = null,
             networkError = null
         )
-        viewModelScope.launch {
-            failedRequestsMutex.withLock {
-                failedRequests.clear()
-            }
-        }
+        failedRequests.clear()
     }
 
     fun clearMessage() {
@@ -749,11 +727,8 @@ class GeneratorViewModel(
     fun retryFailedRequests() {
         viewModelScope.launch {
             try {
-                val requestsToRetry = failedRequestsMutex.withLock {
-                    failedRequests.values.toList().also {
-                        failedRequests.clear()
-                    }
-                }
+                val requestsToRetry = failedRequests.values.toList()
+                failedRequests.clear()
 
                 if (requestsToRetry.isEmpty()) {
                     logger.info("No failed requests to retry")
@@ -790,9 +765,7 @@ class GeneratorViewModel(
     fun retryFailedRequest(requestId: String) {
         viewModelScope.launch {
             try {
-                val request = failedRequestsMutex.withLock {
-                    failedRequests.remove(requestId)
-                } ?: run {
+                val request = failedRequests.remove(requestId) ?: run {
                     logger.warn("Request $requestId not found in failed requests")
                     return@launch
                 }

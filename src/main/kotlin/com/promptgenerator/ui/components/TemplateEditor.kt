@@ -31,6 +31,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,6 +44,7 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.withStyle
@@ -50,6 +53,7 @@ import androidx.compose.ui.window.Dialog
 import com.promptgenerator.domain.model.Template
 import com.promptgenerator.domain.repository.ValidationResult
 import com.promptgenerator.ui.icons.AppIcons
+import kotlinx.coroutines.delay
 import java.util.UUID
 import java.util.regex.Pattern
 
@@ -70,6 +74,32 @@ fun TemplateEditor(
     var showExpandedDialog by remember { mutableStateOf(false) }
     var showSamplesDialog by remember { mutableStateOf(false) }
     var showTemplatesMenu by remember { mutableStateOf(false) }
+
+    var textFieldValue by remember { mutableStateOf(TextFieldValue(value)) }
+    var debounceValue by remember { mutableStateOf(value) }
+
+    LaunchedEffect(value) {
+        if (value != textFieldValue.text) {
+            textFieldValue = TextFieldValue(value)
+        }
+    }
+
+    LaunchedEffect(textFieldValue.text) {
+        if (textFieldValue.text != debounceValue) {
+            delay(300)
+            debounceValue = textFieldValue.text
+            onValueChange(textFieldValue.text)
+
+            val pattern = Pattern.compile("\\{\\{([^}]+)\\}\\}")
+            val matcher = pattern.matcher(textFieldValue.text)
+            while (matcher.find()) {
+                val placeholder = matcher.group(1)
+                if (placeholder != null && !placeholders.contains(placeholder)) {
+                    onPlaceholderDetected(placeholder)
+                }
+            }
+        }
+    }
 
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -122,7 +152,7 @@ fun TemplateEditor(
                             }
                         }
                     ) {
-                        IconButton(onClick = { /* Tooltip handled by CustomTooltip */ }) {
+                        IconButton(onClick = { }) {
                             Icon(
                                 imageVector = AppIcons.InfoOutlined,
                                 contentDescription = "Help",
@@ -211,18 +241,8 @@ fun TemplateEditor(
             )
 
             OutlinedTextField(
-                value = value,
-                onValueChange = {
-                    onValueChange(it)
-                    val pattern = Pattern.compile("\\{\\{([^}]+)\\}\\}")
-                    val matcher = pattern.matcher(it)
-                    while (matcher.find()) {
-                        val placeholder = matcher.group(1)
-                        if (placeholder != null && !placeholders.contains(placeholder)) {
-                            onPlaceholderDetected(placeholder)
-                        }
-                    }
-                },
+                value = textFieldValue,
+                onValueChange = { textFieldValue = it },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(200.dp),
@@ -281,18 +301,8 @@ fun TemplateEditor(
                     }
 
                     OutlinedTextField(
-                        value = value,
-                        onValueChange = {
-                            onValueChange(it)
-                            val pattern = Pattern.compile("\\{\\{([^}]+)\\}\\}")
-                            val matcher = pattern.matcher(it)
-                            while (matcher.find()) {
-                                val placeholder = matcher.group(1)
-                                if (placeholder != null && !placeholders.contains(placeholder)) {
-                                    onPlaceholderDetected(placeholder)
-                                }
-                            }
-                        },
+                        value = textFieldValue,
+                        onValueChange = { textFieldValue = it },
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f),
